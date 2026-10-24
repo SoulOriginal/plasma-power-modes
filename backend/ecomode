@@ -1,0 +1,2060 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""
+ecomode - deeper-than-power-saver tuning layer.
+
+Design notes
+------------
+* Every tunable is declared as data in KNOBS.  Apply, exact restore and
+  self-test are all derived from that one declaration, so a knob can never
+  be applied without also being restorable and testable.
+* Knobs owned by power-profiles-daemon (EPP, platform_profile, governor)
+  are declared with ppd_owned=True and are NEVER written.  PPD rewrites
+  them on profile changes, so touching them would mean fighting the daemon
+  and would break the slider in System Settings.  We only layer on top of
+  knobs PPD leaves alone.
+* The prior value of every path is recorded in STATE_FILE before the first
+  write, so "off" restores byte-for-byte what was there - not a guessed
+  default.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import functools
+import glob as globmod
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+# tmpfs on purpose: none of these knobs survive a reboot, so neither should
+# the record of them. A persistent state file would claim ECO was still on
+# after a reboot that silently reset every value.
+STATE_DIR = "/run/ecomode"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+PSTATE = "/sys/devices/system/cpu/intel_pstate"
+RAPL = "/sys/class/powercap/intel-rapl:0"
+# The same package limits again, through the MMIO interface. Both are
+# enforced, so the lower of the two is the one that binds.
+RAPL_MMIO = "/sys/class/powercap/intel-rapl-mmio:0"
+THROTTLE = "/sys/devices/system/cpu/cpu0/thermal_throttle"
+MSR_PATH = "/dev/cpu/{cpu}/msr"
+PCI_DEVICES = "/sys/bus/pci/devices"
+
+
+def find_dgpu():
+    """The NVIDIA display controller's sysfs directory, or a path that does
+    not exist. Found by vendor and class rather than by address: the address
+    differs between models."""
+    for dev in sorted(globmod.glob(f"{PCI_DEVICES}/*")):
+        try:
+            with open(f"{dev}/vendor") as fh:
+                vendor = fh.read().strip()
+            with open(f"{dev}/class") as fh:
+                klass = fh.read().strip()
+        except OSError:
+            continue
+        if vendor == "0x10de" and klass.startswith("0x03"):
+            return dev
+    return f"{PCI_DEVICES}/no-nvidia-gpu"
+
+
+DGPU = find_dgpu()
+
+# --- Max mode (see backend/ecomode-max) ------------------------------------
+# The Max keep-alive runs as a transient root service and publishes its
+# state here. Everything this file does with it is read-only, so plain
+# `status` stays cheap and unprivileged.
+MAX_STATE_FILE = os.path.join(STATE_DIR, "max.json")
+MAX_LAST_FILE = os.path.join(STATE_DIR, "max-last.json")
+MAX_STOP_FLAG = os.path.join(STATE_DIR, "max-stop-reason")
+# Published by the watts sampler (ecomode-max watts-run), read by the widget.
+WATTS_FILE = os.path.join(STATE_DIR, "watts")
+# Present while Max has started nvidia-powerd (Dynamic Boost) and owes a stop.
+POWERD_FLAG = os.path.join(STATE_DIR, "powerd-started")
+
+# Boards whose EC drops the user-selected thermal profile 120 s after the
+# last WMI 0x20008/0x10 query. Verified on 8BAB only.
+SUPPORTED_BOARDS = {"8BAB"}
+BOARD_NAME = "/sys/class/dmi/id/board_name"
+PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
+PROFILE_CLASS_GLOB = "/sys/class/platform-profile/platform-profile-*"
+HWMON_GLOB = "/sys/class/hwmon/hwmon*"
+POWER_SUPPLY_GLOB = "/sys/class/power_supply/*"
+THERMAL_GLOB = "/sys/class/thermal/thermal_zone*"
+
+
+# ---------------------------------------------------------------------------
+# Knob registry
+# ---------------------------------------------------------------------------
+# kind:
+#   "file"  - single sysfs file
+#   "glob"  - shell glob expanding to many files, all set to the same value
+#
+# eco: value written in ECO mode, or a dict of them per level.  May be the
+#      string "{max_pct}", substituted with the configured CPU ceiling, or
+#      "{deepest_pct}", the same ceiling but at most DEEPEST_MAX_PCT.
+#
+# ppd_owned: True means power-profiles-daemon manages it -> read-only for us.
+#
+# clamped: True means the kernel may report back a value different from what
+#      we wrote (rounding / clamping), so self-test must not demand equality.
+
+# Deepest never lets the CPU ceiling above this, whatever Deep's is: 30% of
+# the 5200 MHz turbo is about 1.5 GHz, well under the 2.2 GHz base clock.
+DEEPEST_MAX_PCT = 30
+
+KNOBS = [
+    {
+        "id": "rapl_pl1",
+        "label": "Sustained power (PL1)",
+        "kind": "file",
+        "path": f"{RAPL}/constraint_0_power_limit_uw",
+        "eco": {"gentle": 35_000_000, "deep": 25_000_000, "deepest": 20_000_000},
+        "scale": 1_000_000,
+        "unit": " W",
+        "compare": "rapl",
+        "desc": "Caps the package power budget the CPU may sustain. This is "
+                "the strongest lever available: it limits actual watts rather "
+                "than frequency, so short bursts still run at full speed and "
+                "race-to-idle is preserved. Interactive work feels unchanged.",
+        "risk": "low",
+        "ppd_owned": False,
+    },
+    {
+        "id": "rapl_pl2",
+        "label": "Burst power (PL2)",
+        "kind": "file",
+        "path": f"{RAPL}/constraint_1_power_limit_uw",
+        "eco": {"deep": 35_000_000, "deepest": 25_000_000},
+        "scale": 1_000_000,
+        "unit": " W",
+        "compare": "rapl",
+        "desc": "Caps the short-term burst budget too. Only at the 'deep' "
+                "and 'deepest' levels, because lowering it is what makes "
+                "bursts feel slower.",
+        "risk": "low",
+        "ppd_owned": False,
+    },
+    {
+        "id": "max_pct",
+        "label": "CPU ceiling",
+        "kind": "file",
+        "path": f"{PSTATE}/max_perf_pct",
+        "eco": {"deep": "{max_pct}", "deepest": "{deepest_pct}"},
+        "unit": "%",
+        "compare": "exact",
+        "desc": "Caps the maximum P-state as a percent of the highest turbo "
+                "P-state - not of base clock. Base clock is 2200/5200 = 42%, "
+                "so any value at or below 42 already subsumes disabling Turbo "
+                "Boost. Deep uses the configured ceiling, deepest at most "
+                f"{DEEPEST_MAX_PCT}%.",
+        "risk": "low",
+        "ppd_owned": False,
+    },
+    {
+        "id": "dgpu_pm",
+        "label": "dGPU runtime PM",
+        "kind": "file",
+        "path": f"{DGPU}/power/control",
+        "eco": "auto",
+        "desc": "Lets the discrete GPU enter runtime suspend (D3cold) when idle. "
+                "Only effective while no process holds /dev/nvidia*.",
+        "risk": "low",
+        "ppd_owned": False,
+        "clamped": False,
+    },
+    # --- read-only: owned by power-profiles-daemon -------------------------
+    {
+        "id": "epp",
+        "label": "Energy perf preference",
+        "kind": "glob",
+        "path": "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference",
+        "eco": None,
+        "desc": "Managed by power-profiles-daemon. Shown for visibility only.",
+        "risk": "-",
+        "ppd_owned": True,
+        "clamped": False,
+    },
+    {
+        "id": "governor",
+        "label": "CPU governor",
+        "kind": "glob",
+        "path": "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor",
+        "eco": None,
+        "desc": "Managed by power-profiles-daemon.",
+        "risk": "-",
+        "ppd_owned": True,
+        "clamped": False,
+    },
+    {
+        "id": "platform_profile",
+        "label": "Platform profile",
+        "kind": "file",
+        "path": "/sys/firmware/acpi/platform_profile",
+        "eco": None,
+        "desc": "Managed by power-profiles-daemon.",
+        "risk": "-",
+        "ppd_owned": True,
+        "clamped": False,
+    },
+]
+
+DEFAULT_MAX_PCT = 40
+DEFAULT_LEVEL = "gentle"
+
+# gentle - caps only the sustained power budget (PL1). Bursts keep their full
+#          budget, so race-to-idle survives and interactive work feels the
+#          same. All 32 threads and the full turbo range stay available.
+# deep   - also caps burst power (PL2), the frequency ceiling and the dGPU's
+#          graphics clock. Nothing breaks and nothing is disturbed, but heavy
+#          work takes longer.
+# deepest - lower still: 20/25 W, a ceiling of at most 30%, the dGPU at
+#          900 MHz and its memory at the lowest clock. For a machine left
+#          alone, or a battery that has to last.
+LEVELS = ["gentle", "deep", "deepest"]
+# The settings spin box's range. intel_pstate clamps max_perf_pct to
+# min_perf_pct (16 here) without an error, so a ceiling below that would read
+# back as something Eco never wrote.
+MAX_PCT_RANGE = (20, 100)
+
+# Deliberately NOT included, after verifying each on this machine:
+#   no_turbo            - base clock is 2200/5200 = 42% of max turbo, so
+#                         max_perf_pct <= 42 already subsumes it. Saves ~0 at
+#                         idle, can cost energy by breaking race-to-idle, and
+#                         PPD uses it as its thermal-degradation sensor.
+#   min_perf_pct        - silently clamped to 16 (the hardware floor).
+#   hwp_dynamic_boost   - already 0.
+#   ASPM policy         - "default" cannot be written back, so it is a
+#                         one-way door and breaks the exact-restore promise.
+#   USB autosuspend     - the hubs here carry keyboard and mouse receivers.
+#   SATA link power     - no SATA controller on this machine.
+#   core offlining      - idle cores already reach C6/C10; defeats Thread
+#                         Director on this P+E part for <1 W.
+
+
+# ---------------------------------------------------------------------------
+# sysfs helpers
+# ---------------------------------------------------------------------------
+
+def expand(knob):
+    """Return the list of concrete paths this knob covers."""
+    if knob["kind"] == "glob":
+        return sorted(globmod.glob(knob["path"]))
+    return [knob["path"]] if os.path.exists(knob["path"]) else []
+
+
+def read_path(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def write_path(path, value):
+    """Write value, return (ok, error). Never raises."""
+    try:
+        with open(path, "w") as fh:
+            fh.write(str(value))
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+
+
+def read_knob(knob):
+    """Current value: a single string, or None if unavailable.
+
+    For glob knobs, returns the common value, or "mixed" if they differ.
+    """
+    paths = expand(knob)
+    if not paths:
+        return None
+    values = {read_path(p) for p in paths}
+    values.discard(None)
+    if not values:
+        return None
+    if len(values) == 1:
+        return values.pop()
+    return "mixed"
+
+
+def eco_value(knob, max_pct, level=None):
+    """Target value for this knob, or None if it does not apply here.
+
+    `eco` may be a plain value, a "{max_pct}" template, or a per-level dict
+    for knobs whose target differs between gentle and deep.
+    """
+    eco = knob.get("eco")
+    if eco is None:
+        return None
+    if isinstance(eco, dict):
+        if level is None or level not in eco:
+            return None
+        eco = eco[level]
+    return (str(eco).replace("{max_pct}", str(max_pct))
+            .replace("{deepest_pct}", str(min(max_pct, DEEPEST_MAX_PCT))))
+
+
+def humanize(knob, value):
+    if value is None:
+        return "n/a"
+    mapping = knob.get("human")
+    if mapping and value in mapping:
+        return mapping[value]
+    scale = knob.get("scale")
+    if scale:
+        try:
+            return f"{int(value) / scale:g}{knob.get('unit', '')}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value) + knob.get("unit", "")
+
+
+def available(knob):
+    return bool(expand(knob))
+
+
+def in_level(knob, level):
+    eco = knob.get("eco")
+    if isinstance(eco, dict):
+        return level in eco
+    return level in knob.get("levels", LEVELS)
+
+
+def actionable(knob, level=None):
+    """Knobs we are allowed to write at this level."""
+    if knob["ppd_owned"] or knob.get("eco") is None or not available(knob):
+        return False
+    return True if level is None else in_level(knob, level)
+
+
+# ---------------------------------------------------------------------------
+# state
+# ---------------------------------------------------------------------------
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+# Held by ecomode-max while it runs `ecomode off` under its own lock: the
+# child must not wait for a lock its parent holds. pkexec clears the
+# environment, so this cannot be passed in from an unprivileged caller.
+LOCK_HELD_ENV = "ECOMODE_LOCK_HELD"
+
+
+@contextlib.contextmanager
+def state_lock():
+    """An exclusive flock on /run/ecomode/lock, the same one ecomode-max
+    takes: Eco and Max each read what is on and then act on it, and run side
+    by side - two widgets, the widget and the CLI, the GPU guard - they
+    would act on each other's stale view.
+
+    Root's alone (0600 in a root-owned directory). The kernel lets go when
+    the process dies.
+    """
+    if os.environ.get(LOCK_HELD_ENV) == "1":
+        yield
+        return
+    make_state_dir()
+    fd = os.open(os.path.join(STATE_DIR, "lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def locked(command):
+    @functools.wraps(command)
+    def run(args):
+        with state_lock():
+            return command(args)
+    return run
+
+
+def make_state_dir():
+    """STATE_DIR, world-readable whatever umask the caller has: the widget
+    reads the state files here without privileges."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.chmod(STATE_DIR, 0o755)
+
+
+def save_state(state):
+    make_state_dir()
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def clear_state():
+    try:
+        os.remove(STATE_FILE)
+    except OSError:
+        pass
+
+
+def is_on():
+    return load_state() is not None
+
+
+# ---------------------------------------------------------------------------
+# Max mode, read-only side
+# ---------------------------------------------------------------------------
+
+def read_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid):
+    return isinstance(pid, int) and pid > 0 and os.path.exists(f"/proc/{pid}")
+
+
+def max_state():
+    """The running Max keep-alive's published state, or None.
+
+    A state file whose pid is gone is stale - the service died before it
+    could clean up - and is treated as "not running".
+    """
+    state = read_json(MAX_STATE_FILE)
+    if not state or not pid_alive(state.get("pid")):
+        return None
+    return state
+
+
+def current_mode():
+    if max_state() is not None:
+        return "max"
+    if is_on():
+        return "eco"
+    return "normal"
+
+
+def find_hp_hwmon():
+    """The hp-wmi hwmon directory, or None.
+
+    hwmonN numbers are not stable across boots, so match on the name.
+    """
+    for d in sorted(globmod.glob(HWMON_GLOB)):
+        if read_path(f"{d}/name") == "hp":
+            return d
+    return None
+
+
+def fans_controllable():
+    d = find_hp_hwmon()
+    return d is not None and os.path.exists(f"{d}/pwm1_enable")
+
+
+def fan_info():
+    d = find_hp_hwmon()
+    if d is None:
+        return {"available": False, "rpm": [], "pwm_enable": None}
+    rpm = []
+    for path in sorted(globmod.glob(f"{d}/fan*_input")):
+        try:
+            rpm.append(int(read_path(path)))
+        except (TypeError, ValueError):
+            pass
+    return {"available": os.path.exists(f"{d}/pwm1_enable"), "rpm": rpm,
+            "pwm_enable": read_path(f"{d}/pwm1_enable")}
+
+
+def on_ac():
+    """True/False from the mains supply, or None if there is none to ask."""
+    seen = False
+    for d in sorted(globmod.glob(POWER_SUPPLY_GLOB)):
+        if read_path(f"{d}/type") != "Mains":
+            continue
+        seen = True
+        if read_path(f"{d}/online") == "1":
+            return True
+    return False if seen else None
+
+
+def battery_draw_w():
+    """Whole-laptop draw while discharging, in W; None on AC or unknown.
+
+    On battery the pack feeds everything - CPU, screen, dGPU, SSD - so its
+    discharge rate is the only whole-machine figure there is. On AC the
+    adapter has no sensor, and power_now then reports charging, not draw.
+    """
+    for d in sorted(globmod.glob(POWER_SUPPLY_GLOB)):
+        if read_path(f"{d}/type") != "Battery":
+            continue
+        if read_path(f"{d}/status") != "Discharging":
+            return None
+        try:
+            return round(int(read_path(f"{d}/power_now")) / 1_000_000, 1)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _watts(path):
+    try:
+        return round(int(read_path(path)) / 1_000_000, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(path):
+    try:
+        return int(read_path(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def cpu_model():
+    """The CPU's name, without the vendor's marketing prefix."""
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    name = line.split(":", 1)[1].strip()
+                    for junk in ("(R)", "(TM)", "CPU ", "Processor"):
+                        name = name.replace(junk, "")
+                    name = name.split(" Gen Intel ")[-1].replace("Intel Core ", "Core ")
+                    return " ".join(name.split())
+    except OSError:
+        pass
+    return None
+
+
+def cpu_tjmax_c():
+    """Where the CPU starts throttling: coretemp's critical temperature for
+    the package, None when there is no such sensor."""
+    for d in sorted(globmod.glob(HWMON_GLOB)):
+        if read_path(f"{d}/name") not in ("coretemp", "k10temp", "zenpower"):
+            continue
+        try:
+            return int(read_path(f"{d}/temp1_crit")) // 1000
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def cpu_info():
+    """The CPU package's power limits and thermal throttling, all readable
+    without root. What limits it *right now* needs MSR 0x64F, which only the
+    root sampler can read (cpu_limit_now)."""
+    pl = {"pl1_w": _watts(f"{RAPL}/constraint_0_power_limit_uw"),
+          "pl2_w": _watts(f"{RAPL}/constraint_1_power_limit_uw"),
+          "mmio_pl1_w": _watts(f"{RAPL_MMIO}/constraint_0_power_limit_uw"),
+          "mmio_pl2_w": _watts(f"{RAPL_MMIO}/constraint_1_power_limit_uw")}
+    for n in ("1", "2"):
+        vals = [v for v in (pl[f"pl{n}_w"], pl[f"mmio_pl{n}_w"]) if v]
+        pl[f"eff_pl{n}_w"] = min(vals) if vals else None
+    pl["model"] = cpu_model()
+    pl["tjmax_c"] = cpu_tjmax_c()
+    pl["throttle_count"] = _int(f"{THROTTLE}/package_throttle_count")
+    pl["throttle_ms"] = _int(f"{THROTTLE}/package_throttle_total_time_ms")
+    return pl
+
+
+# MSR_CORE_PERF_LIMIT_REASONS (0x64F): the low 16 bits say what holds the
+# cores back at this moment (the high 16 are sticky log bits, left alone:
+# clearing them would be a write). Intel SDM vol. 4, 2.17.
+MSR_PERF_LIMIT_REASONS = 0x64F
+CPU_LIMIT_BITS = [
+    (1 << 10, "PL1"),
+    (1 << 11, "PL2"),
+    (1 << 1, "thermal"),
+    (1 << 0, "PROCHOT"),
+    (1 << 5, "avg thermal"),
+    (1 << 6, "VR thermal"),
+    (1 << 7, "VR current"),
+    (1 << 8, "electrical"),
+    (1 << 12, "turbo limit"),
+    (1 << 13, "turbo attenuation"),
+    (1 << 4, "residency"),
+]
+
+
+def read_msr(reg, cpu=0):
+    """A 64-bit MSR, or None (not root, or no msr driver). Read-only."""
+    try:
+        fd = os.open(MSR_PATH.format(cpu=cpu), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        data = os.pread(fd, 8, reg)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return int.from_bytes(data, "little") if len(data) == 8 else None
+
+
+def decode_cpu_limits(value):
+    if value is None:
+        return None
+    return [name for bit, name in CPU_LIMIT_BITS if value & bit]
+
+
+def cpu_is_intel():
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("vendor_id"):
+                    return line.split(":", 1)[1].strip() == "GenuineIntel"
+    except OSError:
+        pass
+    return False
+
+
+def cpu_limit_now():
+    """What limits the CPU at this moment, e.g. ["PL1"], [] when nothing
+    does; None without root, or on a CPU where 0x64F means something else."""
+    if not cpu_is_intel():
+        return None
+    return decode_cpu_limits(read_msr(MSR_PERF_LIMIT_REASONS))
+
+
+# ---------------------------------------------------------------------------
+# battery and charge limit
+# ---------------------------------------------------------------------------
+# A charge limit through the kernel's standard charge_behaviour property:
+# "inhibit-charge" at the stop level, "auto" again CHARGE_HYSTERESIS below.
+# Any driver that offers both works (ThinkPad, some ASUS, HP boards with the
+# hp-wmi patch in kernel/hp-wmi-charge); where neither is offered, the
+# feature is simply not there. A root service keeps the window, also with
+# nobody logged in, since charging overnight is when it matters.
+
+CHARGE_DIR = "/var/lib/ecomode"           # persistent: the choice outlives a reboot
+CHARGE_CONF = os.path.join(CHARGE_DIR, "charge.json")
+CHARGE_UNIT = "ecomode-charge.service"
+CHARGE_STOP_RANGE = (50, 95)
+CHARGE_HYSTERESIS = 5
+CHARGE_SECS = 30
+CHARGE_AUTO, CHARGE_INHIBIT = "auto", "inhibit-charge"
+
+
+def find_battery():
+    """The laptop's own battery: type Battery, not a device's (a mouse or a
+    headset reports scope=Device), and present."""
+    for d in sorted(globmod.glob(POWER_SUPPLY_GLOB)):
+        if read_path(f"{d}/type") != "Battery":
+            continue
+        if read_path(f"{d}/scope") == "Device" or read_path(f"{d}/present") == "0":
+            continue
+        return d
+    return None
+
+
+def parse_behaviour(text):
+    """charge_behaviour as sysfs shows it, "auto [inhibit-charge]": (the
+    current mode, every mode offered)."""
+    if not text:
+        return None, []
+    offered, current = [], None
+    for word in text.split():
+        if word.startswith("[") and word.endswith("]"):
+            word = word[1:-1]
+            current = word
+        offered.append(word)
+    return current, offered
+
+
+def charge_supported(bat):
+    _, offered = parse_behaviour(read_path(f"{bat}/charge_behaviour") if bat else None)
+    return CHARGE_AUTO in offered and CHARGE_INHIBIT in offered
+
+
+def load_charge_conf():
+    conf = read_json(CHARGE_CONF) or {}
+    stop = conf.get("stop")
+    lo, hi = CHARGE_STOP_RANGE
+    if isinstance(stop, bool) or not isinstance(stop, int) or not lo <= stop <= hi:
+        stop = 80
+    return {"enabled": conf.get("enabled") is True, "stop": stop}
+
+
+def save_charge_conf(conf):
+    os.makedirs(CHARGE_DIR, exist_ok=True)
+    os.chmod(CHARGE_DIR, 0o755)
+    tmp = CHARGE_CONF + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(conf, fh)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CHARGE_CONF)
+
+
+def _uw(path):
+    try:
+        return int(read_path(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def battery_info():
+    """Charge, health and charging mode of the laptop's battery; None when
+    it has none. Sysfs only."""
+    bat = find_battery()
+    if bat is None:
+        return None
+    now, full, design = (_uw(f"{bat}/energy_{k}") for k in ("now", "full", "full_design"))
+    power = _uw(f"{bat}/power_now")
+    status = read_path(f"{bat}/status")
+    current, offered = parse_behaviour(read_path(f"{bat}/charge_behaviour"))
+    conf = load_charge_conf()
+    info = {
+        "name": os.path.basename(bat),
+        "status": status,
+        "capacity": _uw(f"{bat}/capacity"),
+        "energy_wh": round(now / 1e6, 1) if now is not None else None,
+        "full_wh": round(full / 1e6, 1) if full is not None else None,
+        "design_wh": round(design / 1e6, 1) if design is not None else None,
+        "health_pct": round(100 * full / design) if full and design else None,
+        "cycles": _uw(f"{bat}/cycle_count") or None,     # 0 here means "not kept"
+        "minutes_left": None,
+        "charge_mode": current,
+        "charge_supported": CHARGE_AUTO in offered and CHARGE_INHIBIT in offered,
+        "limit": conf if conf["enabled"] else None,
+        "limit_stop": conf["stop"],
+    }
+    if power and now is not None:
+        if status == "Discharging":
+            info["minutes_left"] = round(60 * now / power)
+        elif status == "Charging" and full:
+            target = full * (conf["stop"] / 100 if conf["enabled"] else 1)
+            if target > now:
+                info["minutes_left"] = round(60 * (target - now) / power)
+    return info
+
+
+def charge_decide(ac, capacity, current, stop):
+    """The mode the window wants now, or None to leave it. On battery the
+    flag means nothing and is cleared, so that nothing is left set by
+    accident; between start and stop the current mode stays, which is what
+    keeps it from flapping."""
+    if ac is not True:
+        return CHARGE_AUTO if current != CHARGE_AUTO else None
+    if capacity is None:
+        return None
+    if capacity >= stop:
+        want = CHARGE_INHIBIT
+    elif capacity <= stop - CHARGE_HYSTERESIS:
+        want = CHARGE_AUTO
+    else:
+        return None
+    return want if want != current else None
+
+
+def charge_round():
+    """One service round: (written mode or None, error or None). Does
+    nothing - and says so - when the battery offers no charge_behaviour."""
+    bat = find_battery()
+    if not charge_supported(bat):
+        return None, "no charge_behaviour with auto and inhibit-charge"
+    conf = load_charge_conf()
+    current, _ = parse_behaviour(read_path(f"{bat}/charge_behaviour"))
+    if not conf["enabled"]:
+        want = CHARGE_AUTO if current != CHARGE_AUTO else None
+    else:
+        want = charge_decide(on_ac(), _uw(f"{bat}/capacity"), current, conf["stop"])
+    if want is None:
+        return None, None
+    ok, err = write_path(f"{bat}/charge_behaviour", want)
+    return (want, None) if ok else (None, f"{want}: {err}")
+
+
+def pkg_temp_c():
+    for d in sorted(globmod.glob(THERMAL_GLOB)):
+        if read_path(f"{d}/type") == "x86_pkg_temp":
+            try:
+                return int(read_path(f"{d}/temp")) // 1000
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def max_support():
+    """(supported, reason). Cheap sysfs checks only; whether
+    power-profiles-daemon is up needs D-Bus and is checked in ecomode-max."""
+    board = read_path(BOARD_NAME)
+    if board not in SUPPORTED_BOARDS:
+        return False, (f"board {board or '?'} is not a known HP OMEN "
+                       "with the 120 s EC timeout")
+    for d in sorted(globmod.glob(PROFILE_CLASS_GLOB)):
+        if read_path(f"{d}/name") != "hp-wmi":
+            continue
+        if "performance" in (read_path(f"{d}/choices") or "").split():
+            return True, None
+        return False, "hp-wmi offers no performance profile"
+    return False, "platform profile is not driven by hp-wmi"
+
+
+def max_public(state):
+    """The part of the keep-alive state the widget needs."""
+    if state is None:
+        return None
+    keys = ("state", "pause_reason", "fans", "since", "last_tick",
+            "last_tick_ok", "last_error", "fans_state", "settle_until",
+            "fans_armed_until")
+    out = {k: state.get(k) for k in keys}
+    out["active"] = True
+    return out
+
+
+# ---------------------------------------------------------------------------
+# nvidia / dgpu insight
+# ---------------------------------------------------------------------------
+# Measured on this machine (driver 610, RTX 4060 Laptop): `nvidia-smi -pl` is
+# refused by the laptop vBIOS, while clock locks work - under a render,
+# -lgc 210,900 took the card from 66 W to 19 W, and -lmc 405,405 on top to
+# 6 W. So the GPU levers are clock locks, never a power limit.
+
+DRI_BY_PATH = "/dev/dri/by-path"
+GPU_FILE = os.path.join(STATE_DIR, "gpu.json")
+GPU_UNIT = "ecomode-gpu.service"
+GPU_GUARD_SECS = 5
+GPU_MIN_MHZ = 210             # the lowest graphics clock the card offers
+# Graphics clock ceiling, and the memory clock to pin, per level.
+GPU_CAPS = {
+    "deep": {"gr": 1500, "mem": None},
+    "deepest": {"gr": 900, "mem": 405},
+}
+SELF_PATH = os.path.realpath(__file__)
+
+# (key in our JSON, nvidia-smi field, parser)
+# The name comes last and may itself contain commas (parse_gpu_csv).
+GPU_FIELDS = [
+    ("pstate", "pstate", str),
+    ("power_w", "power.draw", float),
+    ("limit_w", "enforced.power.limit", float),
+    ("default_limit_w", "power.default_limit", float),
+    ("max_limit_w", "power.max_limit", float),
+    ("util_pct", "utilization.gpu", int),
+    ("mem_util_pct", "utilization.memory", int),
+    ("temp_c", "temperature.gpu", int),
+    ("gr_mhz", "clocks.gr", int),
+    ("mem_mhz", "clocks.mem", int),
+    ("gr_max_mhz", "clocks.max.gr", int),
+    ("mem_max_mhz", "clocks.max.mem", int),
+    ("vram_used_mib", "memory.used", int),
+    ("vram_total_mib", "memory.total", int),
+    ("reasons_raw", "clocks_event_reasons.active", lambda v: int(v, 16)),
+    ("name", "name", str),
+]
+
+# nvmlClocksEventReasons bits, as nvidia-smi reports them.
+GPU_REASONS = [
+    (0x004, "power cap"),
+    (0x008, "hardware slowdown"),
+    (0x020, "thermal (driver)"),
+    (0x040, "thermal (hardware)"),
+    (0x080, "power brake"),
+    (0x002, "clock setting"),
+    (0x100, "display clock"),
+    (0x010, "sync boost"),
+]
+
+
+def run(argv, timeout=10):
+    """(returncode, stdout, stderr); returncode None when it could not run."""
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "", str(exc)
+    return res.returncode, res.stdout, res.stderr
+
+
+def nvsmi(*argv, timeout=10):
+    if not shutil.which("nvidia-smi"):
+        return None, "", "nvidia-smi not found"
+    return run(["nvidia-smi", *argv], timeout=timeout)
+
+
+def parse_gpu_csv(line):
+    """One `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` line as
+    a dict over GPU_FIELDS; "[N/A]" and anything unparsable become None."""
+    values = [v.strip() for v in line.split(",", len(GPU_FIELDS) - 1)]
+    if len(values) != len(GPU_FIELDS):
+        return None
+    out = {}
+    for (key, _, conv), raw in zip(GPU_FIELDS, values):
+        try:
+            out[key] = None if raw.startswith("[") or raw == "" else conv(raw)
+        except ValueError:
+            out[key] = None
+    raw = out.get("reasons_raw")
+    out["reasons"] = [] if raw is None else \
+        [name for bit, name in GPU_REASONS if raw & bit]
+    return out
+
+
+def gpu_query():
+    """What the dGPU is doing, or None. Talking to the driver wakes a
+    sleeping GPU, so callers ask only while it is already awake."""
+    fields = ",".join(f for _, f, _ in GPU_FIELDS)
+    code, out, _ = nvsmi(f"--query-gpu={fields}", "--format=csv,noheader,nounits",
+                         timeout=5)
+    if code != 0 or not out.strip():
+        return None
+    return parse_gpu_csv(out.strip().split("\n")[0])
+
+
+def gpu_runtime():
+    """Runtime PM state from sysfs; reading it never wakes the GPU."""
+    def ms(name):
+        try:
+            return int(read_path(f"{DGPU}/power/{name}"))
+        except (TypeError, ValueError):
+            return None
+    return {"status": read_path(f"{DGPU}/power/runtime_status"),
+            "suspended_ms": ms("runtime_suspended_time"),
+            "active_ms": ms("runtime_active_time")}
+
+
+def dgpu_connectors(enabled_only=False):
+    """Display connectors the dGPU drives (connected, and enabled if asked)."""
+    found = []
+    for conn in sorted(globmod.glob("/sys/class/drm/card*-*")):
+        if read_path(f"{conn}/status") != "connected":
+            continue
+        if enabled_only and read_path(f"{conn}/enabled") != "enabled":
+            continue
+        try:
+            driver = os.path.basename(
+                os.path.realpath(f"{conn}/../device/driver"))
+        except OSError:
+            driver = "?"
+        if driver == "nvidia":
+            found.append(os.path.basename(conn))
+    return found
+
+
+def dgpu_nodes():
+    """Device nodes that reach the dGPU: /dev/nvidia* and its DRM card and
+    render nodes (Vulkan and EGL clients often hold only the render node)."""
+    nodes = set(globmod.glob("/dev/nvidia*"))
+    addr = os.path.basename(DGPU)
+    for kind in ("card", "render"):
+        link = f"{DRI_BY_PATH}/pci-{addr}-{kind}"
+        if os.path.exists(link):
+            nodes.add(os.path.realpath(link))
+    return nodes
+
+
+def _comm(pid):
+    return read_path(f"/proc/{pid}/comm") or "?"
+
+
+def _ppid(pid):
+    stat = read_path(f"/proc/{pid}/stat") or ""
+    try:
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def is_sensor_follower(pid, name):
+    """KDE's GPU sensor: ksystemstats runs `nvidia-smi dmon` for as long as a
+    widget subscribes. A widget that subscribes only while something else
+    keeps the GPU busy (the patched Thermal Monitor) makes it a follower:
+    it is not what keeps the card awake."""
+    return name == "nvidia-smi" and _comm(_ppid(pid)) == "ksystemstats"
+
+
+def holder_note(pid, name, awake):
+    """Why a holder is there, when the name alone does not say."""
+    if is_sensor_follower(pid, name):
+        return ("KDE's GPU sensor (ksystemstats): keeps the GPU awake while "
+                "a widget shows a GPU sensor")
+    if name == "nvidia-smi":
+        return f"started by {_comm(_ppid(pid))}"
+    if not awake:
+        return "display node only: does not keep it awake"
+    if name in ("Xwayland", "kwin_wayland"):
+        return "the desktop renders on the GPU"
+    return None
+
+
+def gpu_holders(exclude=()):
+    """Processes holding a dGPU node. As a user this sees the user's own
+    processes; as root, all of them.
+
+    `awake`: it has a /dev/nvidia* node open, i.e. is a client of the
+    driver, which is what keeps the card out of D3cold. A process with only
+    the DRM card node open (Xwayland, the compositor) does not: the card has
+    been seen asleep with those running. `follower`: KDE's GPU sensor, which
+    a gated widget runs only while something else keeps the card awake.
+    """
+    nodes = dgpu_nodes()
+    by_name = {}
+    for pid_dir in globmod.glob("/proc/[0-9]*"):
+        pid = int(os.path.basename(pid_dir))
+        if pid in exclude:
+            continue
+        try:
+            fds = os.listdir(f"{pid_dir}/fd")
+        except OSError:
+            continue
+        hits = set()
+        for fd in fds:
+            try:
+                target = os.readlink(f"{pid_dir}/fd/{fd}")
+            except OSError:
+                continue
+            if target in nodes:
+                hits.add(target)
+        if not hits:
+            continue
+        name = _comm(pid)
+        awake = any(t.startswith("/dev/nvidia") for t in hits)
+        entry = by_name.get(name)
+        if entry is None:
+            by_name[name] = {"pid": pid, "name": name, "count": 1, "awake": awake,
+                             "follower": is_sensor_follower(pid, name),
+                             "note": holder_note(pid, name, awake)}
+        else:
+            entry["count"] += 1
+            if awake and not entry["awake"]:
+                entry.update(awake=True, note=holder_note(pid, name, True))
+    return sorted(by_name.values(), key=lambda h: (not h["awake"], h["name"].lower()))
+
+
+def keeps_awake(holders):
+    """The holders that really keep the dGPU awake."""
+    return [h for h in holders if h.get("awake") and not h.get("follower")]
+
+
+def service_active(name):
+    code, _, _ = run(["systemctl", "is-active", "--quiet", name], timeout=5)
+    return code == 0
+
+
+def dgpu_info(deep=False):
+    """Who is keeping the discrete GPU awake, and what it is doing.
+
+    deep=False is the routine path used by the panel widget: sysfs only.
+    The expensive parts - walking every /proc/*/fd and asking nvidia-smi -
+    are gated behind deep=True, and nvidia-smi is asked only while the GPU
+    is awake anyway, because talking to the driver *wakes the GPU*. Polling
+    it on a timer would keep the card permanently awake.
+    """
+    rt = gpu_runtime()
+    info = {
+        "present": os.path.exists(DGPU),
+        "runtime_status": rt["status"],
+        "control": read_path(f"{DGPU}/power/control"),
+        "suspended_ms": rt["suspended_ms"],
+        "active_ms": rt["active_ms"],
+        "displays": dgpu_connectors(),
+        "caps": read_json(GPU_FILE),
+        "holders": [],
+        "gpu": None,
+        "power_w": None,
+        "powerd": None,
+        "deep": deep,
+    }
+    if not info["present"] or not deep:
+        return info
+    info["holders"] = gpu_holders()
+    info["powerd"] = service_active("nvidia-powerd")
+    if info["runtime_status"] == "active":
+        info["gpu"] = gpu_query()
+        if info["gpu"]:
+            info["power_w"] = info["gpu"].get("power_w")
+    return info
+
+
+# --- clock caps for the deep levels ----------------------------------------
+
+def save_gpu(rec):
+    make_state_dir()
+    tmp = GPU_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, GPU_FILE)
+
+
+def clear_gpu():
+    for path in (GPU_FILE, GPU_FILE + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def gpu_controllable():
+    """Clock locks need NVIDIA's own driver and nvidia-smi; with nouveau, or
+    no NVIDIA card at all, the deep levels leave the GPU alone."""
+    if not os.path.exists(DGPU) or not shutil.which("nvidia-smi"):
+        return False
+    try:
+        return os.path.basename(os.path.realpath(f"{DGPU}/driver")) == "nvidia"
+    except OSError:
+        return False
+
+
+def apply_gpu_caps(level, prev=None):
+    """Lock the dGPU's clocks for `level`; returns the record to save, or
+    None when the level has no GPU caps or there is no dGPU.
+
+    A sleeping GPU is left asleep: the record says "pending" and the guard
+    applies the locks once something wakes the card. The memory lock is
+    skipped while a display hangs off the dGPU - scan-out at the lowest
+    memory clock is the one place it could glitch.
+    """
+    caps = GPU_CAPS.get(level)
+    if not caps or not gpu_controllable():
+        return None
+    prev = prev or {}
+    rt = gpu_runtime()
+    displays = dgpu_connectors()
+    mem = caps["mem"] if not displays else None
+    rec = {
+        "level": level, "gr": caps["gr"], "mem": mem,
+        "mem_skipped": "a display is on the dGPU" if caps["mem"] and displays else None,
+        "applied": False, "pending": False, "error": None,
+        # Whether a lock ever reached the driver, so `off` knows to reset.
+        "gr_ever": bool(prev.get("gr_ever")),
+        "mem_ever": bool(prev.get("mem_ever")),
+        "slept_mark": rt["suspended_ms"],
+        "at": int(time.time()),
+    }
+    if rt["status"] != "active":
+        rec["pending"] = True
+        return rec
+    errors = []
+    # Marked before the call and saved, so that a call cut short - the guard
+    # stopped mid-way - still gets reset by `off`. Only a definite refusal
+    # takes the mark back.
+    gr_before, mem_before = rec["gr_ever"], rec["mem_ever"]
+    rec["gr_ever"] = True
+    rec["mem_ever"] = mem_before or bool(mem)
+    save_gpu(rec)
+    code, out, err = nvsmi("-lgc", f"{GPU_MIN_MHZ},{caps['gr']}")
+    if code != 0:
+        rec["gr_ever"] = gr_before
+        errors.append("graphics clock: " + ((err or out).strip() or "failed"))
+    if mem:
+        code, out, err = nvsmi("-lmc", f"{mem},{mem}")
+        if code != 0:
+            rec["mem_ever"] = mem_before
+            errors.append("memory clock: " + ((err or out).strip() or "failed"))
+    elif rec["mem_ever"]:
+        nvsmi("-rmc")            # a display came along: give memory its range back
+        rec["mem_ever"] = False
+    rec["applied"] = not errors
+    rec["error"] = "; ".join(errors) or None
+    rec["fails"] = int(prev.get("fails") or 0) + 1 if errors else 0
+    return rec
+
+
+def reset_gpu_caps(rec):
+    """Undo what apply_gpu_caps did. Asks the driver only if a lock ever
+    reached it - so a GPU that slept through Eco is not woken to undo
+    nothing. Returns a list of errors."""
+    errors = []
+    if not rec:
+        return errors
+    if rec.get("gr_ever"):
+        code, out, err = nvsmi("-rgc")
+        if code != 0:
+            errors.append("graphics clock: " + ((err or out).strip() or "failed"))
+    if rec.get("mem_ever"):
+        code, out, err = nvsmi("-rmc")
+        if code != 0:
+            errors.append("memory clock: " + ((err or out).strip() or "failed"))
+    return errors
+
+
+def guard_cmd():
+    """systemd-run for the GPU guard: lives as long as a capped Eco level,
+    locked down, writing only /run/ecomode."""
+    return [
+        "systemd-run", f"--unit={GPU_UNIT}", "--collect", "--quiet",
+        "--description=Eco: keep the dGPU clock cap after it wakes",
+        "-p", "NoNewPrivileges=yes", "-p", "ProtectHome=yes",
+        "-p", "PrivateTmp=yes", "-p", "ProtectSystem=strict",
+        "-p", f"ReadWritePaths={STATE_DIR}",
+        "--", SELF_PATH, "gpu-guard",
+    ]
+
+
+def start_guard():
+    if service_active(GPU_UNIT):
+        return None
+    make_state_dir()           # ReadWritePaths= fails the unit if it is missing
+    run(["systemctl", "reset-failed", GPU_UNIT])
+    code, _, err = run(guard_cmd())
+    return None if code == 0 else ("could not start the GPU guard: " +
+                                   (err.strip() or str(code)))
+
+
+def gpu_on(level):
+    """Clock caps for `level` plus the guard that keeps them. Returns the
+    record (None when the level has none)."""
+    rec = apply_gpu_caps(level, read_json(GPU_FILE))
+    if rec is None:
+        return None
+    err = start_guard()
+    if err:
+        rec["error"] = "; ".join(e for e in (rec["error"], err) if e)
+    save_gpu(rec)
+    return rec
+
+
+def gpu_off():
+    """Stop the guard, then give the GPU its full clock range back."""
+    run(["systemctl", "stop", GPU_UNIT])
+    errors = reset_gpu_caps(read_json(GPU_FILE))
+    clear_gpu()
+    return errors
+
+
+GUARD_RETRY_MAX_S = 600
+
+
+def guard_due(rec, rt, now):
+    """Whether the guard should lock the clocks now.
+
+    The driver may drop a lock when the card powers off; runtime_suspended_time
+    grows only while it is off, so a changed mark means it slept since. A
+    lock the driver refused is retried after a sleep, or with a growing
+    pause: asking every round would itself keep the card awake.
+    """
+    if rt["status"] != "active":
+        return False
+    if rec.get("slept_mark") != rt["suspended_ms"]:
+        return True
+    if rec.get("applied"):
+        return False
+    if not rec.get("error"):
+        return True                       # pending: never tried while awake
+    fails = max(1, int(rec.get("fails") or 1))
+    wait = min(GUARD_RETRY_MAX_S, 30 * 2 ** (fails - 1))
+    return now - int(rec.get("at") or 0) >= wait
+
+
+def guard_round(now=None):
+    """One guard round. False once there is nothing left to guard."""
+    with state_lock():
+        state = load_state()
+        if not state or state.get("level") not in GPU_CAPS:
+            return False
+        rec = read_json(GPU_FILE) or {}
+        if guard_due(rec, gpu_runtime(), time.time() if now is None else now):
+            new = apply_gpu_caps(state["level"], rec)
+            if new is not None:
+                save_gpu(new)
+        return True
+
+
+@locked
+def cmd_charge(args):
+    """Charge limit on or off. On: the stop level is saved, the service is
+    enabled, and the window applies at once. Off: back to normal charging."""
+    bat = find_battery()
+    if args.action == "off":
+        conf = load_charge_conf()
+        conf["enabled"] = False
+        save_charge_conf(conf)
+        run(["systemctl", "disable", "--now", CHARGE_UNIT])
+        if charge_supported(bat):
+            write_path(f"{bat}/charge_behaviour", CHARGE_AUTO)
+        emit({"ok": True, "limit": None, "battery": battery_info()}, args)
+        return 0
+    if not charge_supported(bat):
+        emit({"ok": False, "reason": "this battery offers no charge_behaviour with "
+              "auto and inhibit-charge (HP OMEN 16-wf0: kernel/hp-wmi-charge)"}, args)
+        return 1
+    code, _, _ = run(["systemctl", "cat", CHARGE_UNIT], timeout=5)
+    if code != 0:
+        emit({"ok": False, "reason": f"{CHARGE_UNIT} is not installed; run install.sh"}, args)
+        return 1
+    save_charge_conf({"enabled": True, "stop": args.stop})
+    code, _, err = run(["systemctl", "enable", "--now", CHARGE_UNIT])
+    if code != 0:
+        emit({"ok": False, "reason": "could not start the charge service: " +
+              (err.strip() or str(code))}, args)
+        return 1
+    written, error = charge_round()
+    emit({"ok": error is None, "reason": error, "written": written,
+          "limit": load_charge_conf(), "battery": battery_info()}, args)
+    return 0 if error is None else 1
+
+
+def cmd_charge_run(args):
+    """The service: keeps the window every CHARGE_SECS for as long as the
+    limit is on. On stop it clears the inhibit unless the battery is at or
+    above the stop level - then the limit holds over a shutdown, and no
+    battery is ever left unable to charge below it."""
+    if not os.environ.get("INVOCATION_ID"):
+        print("ecomode: 'charge-run' is started by systemd only", file=sys.stderr)
+        return 2
+    import signal
+
+    def on_term(_signum, _frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    last_error = None
+    try:
+        while load_charge_conf()["enabled"]:
+            written, error = charge_round()
+            if written:
+                print(f"ecomode charge: {written} at "
+                      f"{read_path(f'{find_battery()}/capacity')} %", flush=True)
+            if error != last_error and error:
+                print(f"ecomode charge: {error}", file=sys.stderr, flush=True)
+            last_error = error
+            time.sleep(CHARGE_SECS)
+        charge_round()               # disabled: back to auto
+        return 0
+    finally:
+        bat = find_battery()
+        conf = load_charge_conf()
+        capacity = _uw(f"{bat}/capacity") if bat else None
+        if charge_supported(bat) and not (conf["enabled"] and capacity is not None
+                                          and capacity >= conf["stop"]):
+            write_path(f"{bat}/charge_behaviour", CHARGE_AUTO)
+
+
+def cmd_gpu_guard(args):
+    if not os.environ.get("INVOCATION_ID"):
+        print("ecomode: 'gpu-guard' is started by systemd only", file=sys.stderr)
+        return 2
+    import signal
+
+    def on_term(_signum, _frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    while guard_round():
+        time.sleep(GPU_GUARD_SECS)
+    return 0
+
+
+POWER_WINDOW_S = 1.0     # the finest reading handed out without a password
+
+
+def sample_power(seconds=POWER_WINDOW_S):
+    """Average package watts over `seconds`, or None if not permitted.
+
+    RAPL exposes a monotonically increasing energy counter, so power is the
+    slope: delta microjoules over delta seconds. `energy_uj` is root-only
+    (a PLATYPUS side-channel mitigation), so this returns None when the
+    helper runs unprivileged - which is the normal case for `status`.
+    """
+    path = f"{RAPL}/energy_uj"
+    first = read_path(path)
+    if first is None:
+        return None
+
+    start = time.monotonic()
+    time.sleep(seconds)
+    second = read_path(path)
+    elapsed = time.monotonic() - start
+    if second is None or elapsed <= 0:
+        return None
+
+    try:
+        delta = int(second) - int(first)
+    except (TypeError, ValueError):
+        return None
+
+    if delta < 0:
+        # The counter wrapped; fold it back over its range.
+        rng = read_path(f"{RAPL}/max_energy_range_uj")
+        try:
+            delta += int(rng)
+        except (TypeError, ValueError):
+            return None
+
+    return round(delta / elapsed / 1_000_000, 2)
+
+
+# power-profiles-daemon's names for the platform_profile values it sets on
+# this machine. Any other value (quiet, cool, custom...) is left for the
+# daemon itself to name.
+PPD_PROFILE_NAMES = {"low-power": "power-saver", "balanced": "balanced",
+                     "performance": "performance"}
+
+
+def ppd_profile():
+    """The power profile, read from platform_profile.
+
+    The widget runs `status` while its popup is open, and powerprofilesctl
+    is one more Python process per call; the sysfs file names the same
+    profile for the values the daemon writes here.
+    """
+    name = PPD_PROFILE_NAMES.get(read_path(PLATFORM_PROFILE))
+    return name if name is not None else ppd_profile_ctl()
+
+
+def ppd_profile_ctl():
+    if not shutil.which("powerprofilesctl"):
+        return None
+    try:
+        out = subprocess.run(["powerprofilesctl", "get"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def cpu_avg_mhz():
+    total = count = 0
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("cpu MHz"):
+                    total += float(line.split(":")[1])
+                    count += 1
+    except (OSError, ValueError):
+        return None
+    return round(total / count) if count else None
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    state = load_state()
+    max_pct = state.get("max_pct", DEFAULT_MAX_PCT) if state else DEFAULT_MAX_PCT
+    level = state.get("level", args.level) if state else args.level
+
+    knobs = []
+    for knob in KNOBS:
+        if not available(knob):
+            continue
+        current = read_knob(knob)
+        applies = actionable(knob, level)
+        target = eco_value(knob, max_pct, level) if applies else None
+        knobs.append({
+            "id": knob["id"],
+            "label": knob["label"],
+            "current": current,
+            "current_human": humanize(knob, current),
+            "eco_target": target,
+            "eco_target_human": humanize(knob, target) if target else None,
+            "at_eco": (target is not None and current == target),
+            "managed": knob["ppd_owned"],
+            "in_level": applies,
+            "risk": knob["risk"],
+            "desc": knob["desc"],
+            "saved": (state or {}).get("knobs", {}).get(knob["id"]),
+        })
+
+    result = {
+        "on": is_on(),
+        "since": (state or {}).get("since"),
+        "level": level,
+        "max_pct": max_pct,
+        "ppd_profile": ppd_profile(),
+        "cpu_avg_mhz": cpu_avg_mhz(),
+        "cpu": cpu_info(),
+        "dgpu": dgpu_info(deep=args.deep),
+        "gpu_caps_target": GPU_CAPS.get(level),
+        # Recorded at apply time by the privileged path; readable here
+        # because the state file is world-readable while energy_uj is not.
+        "power_before": (state or {}).get("power_before"),
+        "power_after": (state or {}).get("power_after"),
+        "knobs": knobs,
+    }
+    supported, reason = max_support()
+    result.update({
+        "mode": current_mode(),
+        "max_supported": supported,
+        "max_unsupported_reason": reason,
+        "max": max_public(max_state()),
+        "max_last": read_json(MAX_LAST_FILE),
+        "gpu_boost": os.path.exists(POWERD_FLAG),
+        "fans": fan_info(),
+        "pkg_temp_c": pkg_temp_c(),
+        "on_ac": on_ac(),
+        "battery": battery_info(),
+    })
+    emit(result, args)
+    return 0
+
+
+@locked
+def cmd_on(args):
+    # Eco caps PL1; Max exists to lift the cap. Stacking them would leave
+    # the widget showing one mode while the machine runs another.
+    if max_state() is not None:
+        emit({"ok": False, "msg": "max mode is on; turn it off first"}, args)
+        return 1
+
+    max_pct = args.max_pct
+    level = args.level
+    switched = False
+
+    state = load_state()
+    if state:
+        if state.get("level") == level and state.get("max_pct") == max_pct:
+            return reapply(state, args)
+        # Switching level while on. Put every knob back to its recorded
+        # original first, so the new level is captured against untouched
+        # values rather than against the previous level's writes - otherwise
+        # "off" would later restore the wrong numbers.
+        _, revert_failed, _ = restore_all(state)
+        gpu_off()
+        if revert_failed:
+            emit({"ok": False, "failed": revert_failed,
+                  "msg": "could not revert the previous level"}, args)
+            return 1
+        clear_state()
+        switched = True
+
+    saved = {}
+    written = {}
+    applied = []
+    failed = []
+
+    # Measure immediately before and immediately after applying, a second
+    # apart under the same workload. Comparing a reading taken now against
+    # one taken at some other time would say more about what the machine
+    # happened to be doing than about the effect of the knobs.
+    # One-second windows: this runs without a password, and the energy
+    # counter is root-only because finer readings leak what other code does.
+    power_before = sample_power(POWER_WINDOW_S)
+
+    for knob in KNOBS:
+        if not actionable(knob, level):
+            continue
+        target = eco_value(knob, max_pct, level)
+        paths = expand(knob)
+
+        # Record prior value per concrete path BEFORE touching anything.
+        saved[knob["id"]] = {p: read_path(p) for p in paths}
+
+        errors = []
+        for p in paths:
+            ok, err = write_path(p, target)
+            if not ok:
+                errors.append(f"{p}: {err}")
+            else:
+                # What the kernel kept is what counts as ours later: it may
+                # round or clamp the value it was given.
+                written[p] = read_path(p)
+        if errors:
+            failed.append({"id": knob["id"], "errors": errors})
+        else:
+            applied.append(knob["id"])
+
+    power_after = sample_power(POWER_WINDOW_S)
+
+    # The state goes first: the GPU guard started below reads it.
+    save_state({
+        "since": int(time.time()),
+        "level": level,
+        "max_pct": max_pct,
+        "power_before": power_before,
+        "power_after": power_after,
+        "knobs": saved,
+        "written": written,
+    })
+    gpu = gpu_on(level)
+
+    verdict = selftest("on", max_pct, level)
+    emit({"ok": not failed and verdict["pass"], "level": level,
+          "switched": switched,
+          "applied": applied, "failed": failed, "selftest": verdict,
+          "gpu": gpu,
+          "power_before": power_before, "power_after": power_after}, args)
+    return 0 if (not failed and verdict["pass"]) else 1
+
+
+def ours(state, path, target):
+    """The value Eco left at `path`: what the kernel read back after the
+    write, or - for a state written before that was recorded - the target."""
+    value = (state.get("written") or {}).get(path)
+    return value if value is not None else target
+
+
+def drifted(state):
+    """Paths of applied knobs that no longer hold Eco's value, as
+    [(knob, path, current, target)].
+
+    hp-wmi rewrites RAPL on every platform_profile write - Fn+P, the KDE
+    slider, power-profiles-daemon - so Eco can be undone under it while its
+    state still says it is on.
+    """
+    level = state.get("level", DEFAULT_LEVEL)
+    max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    out = []
+    for knob in KNOBS:
+        if not actionable(knob, level):
+            continue
+        target = eco_value(knob, max_pct, level)
+        for path in expand(knob):
+            current = read_path(path)
+            if current is not None and current != ours(state, path, target):
+                out.append((knob, path, current, target))
+    return out
+
+
+def reapply(state, args):
+    """`on` with the level and ceiling already applied: put back whatever
+    drifted. The drifted value is the firmware's baseline for the profile
+    now in force, so it becomes the recorded original that `off` restores.
+    Nothing drifted is a no-op."""
+    level = state.get("level", DEFAULT_LEVEL)
+    max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    repaired, failed = [], []
+    for knob, path, current, target in drifted(state):
+        state.setdefault("knobs", {}).setdefault(knob["id"], {})[path] = current
+        ok, err = write_path(path, target)
+        if ok:
+            state.setdefault("written", {})[path] = read_path(path)
+            repaired.append(knob["id"])
+        else:
+            failed.append({"id": knob["id"], "errors": [f"{path}: {err}"]})
+    if repaired or failed:
+        save_state(state)
+    if level in GPU_CAPS and not service_active(GPU_UNIT):
+        # The guard died or was stopped; bring it back.
+        rec = gpu_on(level)
+        if rec and rec.get("error"):
+            failed.append({"id": "gpu_caps", "errors": [rec["error"]]})
+    if not repaired and not failed:
+        emit({"ok": True, "noop": True, "msg": "already on"}, args)
+        return 0
+    verdict = selftest("on", max_pct, level)
+    ok = not failed and verdict["pass"]
+    emit({"ok": ok, "level": level, "repaired": sorted(set(repaired)),
+          "failed": failed, "selftest": verdict}, args)
+    return 0 if ok else 1
+
+
+def restore_all(state):
+    """Write every recorded prior value back. Returns (restored, failed,
+    kept).
+
+    A path that no longer holds the value Eco wrote was changed since by
+    someone else - usually the firmware, on a profile change - and is theirs
+    now: it is left as it is and listed in `kept`.
+    """
+    level = state.get("level", DEFAULT_LEVEL)
+    max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    restored, failed, kept = [], [], []
+    for knob in KNOBS:
+        entry = state.get("knobs", {}).get(knob["id"])
+        if not entry:
+            continue
+        target = eco_value(knob, max_pct, level) if in_level(knob, level) else None
+        errors = []
+        for path, prior in entry.items():
+            if prior is None:
+                continue  # was unreadable before; leave it alone
+            current = read_path(path)
+            if (target is not None and current is not None
+                    and current != ours(state, path, target)):
+                kept.append(path)
+                continue
+            ok, err = write_path(path, prior)
+            if not ok:
+                errors.append(f"{path}: {err}")
+        if errors:
+            failed.append({"id": knob["id"], "errors": errors})
+        else:
+            restored.append(knob["id"])
+    return restored, failed, kept
+
+
+@locked
+def cmd_off(args):
+    state = load_state()
+    if state is None:
+        emit({"ok": True, "noop": True, "msg": "already off"}, args)
+        return 0
+
+    restored, failed, kept = restore_all(state)
+    gpu_errors = gpu_off()
+    verdict = verify_restore(state, kept)
+    if not failed and verdict["pass"]:
+        clear_state()
+
+    # A clock lock the driver would not reset is reported, but does not keep
+    # Eco "on": the CPU side is restored and verified.
+    emit({"ok": not failed and verdict["pass"],
+          "restored": restored, "failed": failed, "kept": kept,
+          "gpu_errors": gpu_errors, "selftest": verdict}, args)
+    return 0 if (not failed and verdict["pass"]) else 1
+
+
+def compare_knob(knob, target, current):
+    """Verify one knob. Returns (status, note); status is pass/fail/skipped.
+
+    A naive written == read check gives false results on some knobs, so each
+    declares its own comparator.
+    """
+    if current is None:
+        return "skipped", "not readable on this machine"
+
+    mode = knob.get("compare", "exact")
+
+    if mode == "rapl":
+        # Two separate failure modes here. The firmware may carry the RAPL
+        # lock bit, in which case the write is rejected outright; or the HP
+        # embedded controller may accept it and then rewrite the limit a
+        # second later. A single read only catches the first, so read once
+        # more after a pause and require both to agree.
+        if current != target:
+            return "fail", "firmware rejected the write (RAPL lock bit)"
+        time.sleep(2)
+        again = read_knob(knob)
+        if again != target:
+            return "fail", ("firmware rewrote it back to " +
+                            humanize(knob, again))
+        return "pass", None
+
+    if mode == "advisory":
+        # Value stuck, but the effect it permits is not guaranteed.
+        return "pass", None
+
+    return ("pass", None) if current == target else ("fail", "reads back " +
+                                                     humanize(knob, current))
+
+
+def selftest(expect, max_pct, level):
+    """After apply: every applied knob must verify under its comparator."""
+    checks = []
+    for knob in KNOBS:
+        if not actionable(knob, level):
+            continue
+        target = eco_value(knob, max_pct, level)
+        current = read_knob(knob)
+        status, note = compare_knob(knob, target, current)
+        checks.append({
+            "id": knob["id"], "label": knob["label"],
+            "want": humanize(knob, target), "got": humanize(knob, current),
+            "status": status, "note": note, "ok": status != "fail",
+        })
+    gpu = gpu_check(level)
+    if gpu:
+        checks.append(gpu)
+    return {
+        "phase": expect,
+        "pass": all(c["ok"] for c in checks),
+        "checks": checks,
+    }
+
+
+def gpu_check(level):
+    """Self-test line for the dGPU clock cap. The driver offers no way to
+    read a lock back, so this reports what the last attempt returned."""
+    caps = GPU_CAPS.get(level)
+    if not caps or not gpu_controllable():
+        return None
+    rec = read_json(GPU_FILE) or {}
+    want = f"≤ {caps['gr']} MHz" + (f", VRAM {caps['mem']} MHz" if caps["mem"] else "")
+    if rec.get("error"):
+        status, note = "fail", rec["error"]
+    elif rec.get("applied"):
+        status, note = "pass", rec.get("mem_skipped")
+    else:
+        status, note = "skipped", "GPU asleep; capped when something wakes it"
+    return {"id": "gpu_caps", "label": "dGPU clock cap", "want": want,
+            "got": "locked" if rec.get("applied") else "-",
+            "status": status, "note": note, "ok": status != "fail"}
+
+
+def verify_restore(state, kept=()):
+    """After restore: every path must equal the value recorded at apply time,
+    except those left to whoever changed them since (restore_all's kept)."""
+    checks = []
+    for knob in KNOBS:
+        entry = state.get("knobs", {}).get(knob["id"])
+        if not entry:
+            continue
+        mismatched = []
+        for path, prior in entry.items():
+            if prior is None or path in kept:
+                continue
+            now = read_path(path)
+            if now != prior:
+                mismatched.append({"path": path, "want": prior, "got": now})
+        checks.append({
+            "id": knob["id"], "label": knob["label"],
+            "status": "pass" if not mismatched else "fail",
+            "note": None if not mismatched else "did not take the old value back",
+            "ok": not mismatched, "mismatched": mismatched,
+        })
+    return {"phase": "off", "pass": all(c["ok"] for c in checks), "checks": checks}
+
+
+def diagnostics():
+    """Why ECO mode may be doing very little right now.
+
+    Two effects dominate idle draw on this machine and neither is reachable
+    from sysfs, so the honest thing is to report them rather than pretend a
+    knob fixes them.
+    """
+    notes = []
+
+    # Any enabled connector on the dGPU pins it out of D3cold - NVIDIA's RTD3
+    # documentation states the GPU stays active while it drives a display.
+    driving = dgpu_connectors(enabled_only=True)
+    if driving:
+        notes.append({
+            "id": "dgpu_displays",
+            "severity": "info",
+            "text": (f"{len(driving)} display(s) are driven by the discrete "
+                     "GPU, so it cannot reach D3cold. Its idle draw is a "
+                     "hardware floor here, not a misconfiguration."),
+            "detail": ", ".join(driving),
+        })
+
+    # Deep package C-states are what actually cut SoC idle power. An active
+    # PCIe link (the dGPU above) keeps the package pinned in PC2/PC3.
+    cst = read_path("/sys/kernel/debug/pmc_core/package_cstate_show")
+    if cst:
+        res = {}
+        for line in cst.splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                try:
+                    res[k.strip()] = int(v.strip())
+                except ValueError:
+                    pass
+        total = sum(res.values()) or 1
+        deep = sum(v for k, v in res.items()
+                   if k.split()[-1] in ("C8", "C9", "C10"))
+        if deep / total < 0.01:
+            notes.append({
+                "id": "package_cstates",
+                "severity": "info",
+                "text": ("The CPU package almost never reaches its deep "
+                         "idle states (PC8-PC10), which is the single "
+                         "largest idle power item. Same root cause as above."),
+                "detail": f"deep residency {100 * deep / total:.2f}%",
+            })
+
+    return notes
+
+
+def cmd_diagnostics(args):
+    """Why ECO mode may be doing little. CLI only - too noisy for the panel."""
+    notes = diagnostics()
+    if getattr(args, "json", False):
+        print(json.dumps({"notes": notes}))
+    elif not notes:
+        print("  nothing notable")
+    else:
+        for note in notes:
+            print(f"  [{note['severity']}] {note['text']}")
+            print(f"        {note['detail']}")
+    return 0
+
+
+@locked
+def cmd_power(args):
+    """On-demand package power measurement. Needs root for energy_uj."""
+    watts = sample_power(args.seconds)
+    state = load_state() or {}
+    emit({
+        "watts": watts,
+        "seconds": args.seconds,
+        "readable": watts is not None,
+        "note": None if watts is not None else
+                "energy_uj is root-only; run this through pkexec",
+        "power_before": state.get("power_before"),
+        "power_after": state.get("power_after"),
+    }, args)
+    return 0 if watts is not None else 1
+
+
+def cmd_selftest(args):
+    state = load_state()
+    if state:
+        verdict = selftest("on", state.get("max_pct", DEFAULT_MAX_PCT),
+                           state.get("level", DEFAULT_LEVEL))
+        verdict["applicable"] = True
+    else:
+        # Reporting "passed, 0 checks" here would be a lie dressed as a
+        # success. Nothing was applied, so there is nothing to verify.
+        verdict = {"phase": "off", "pass": None, "applicable": False,
+                   "checks": [], "note": "eco mode is off; nothing to verify"}
+    emit(verdict, args)
+    return 0 if verdict["pass"] else 1
+
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+def emit(data, args):
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+    else:
+        print(render(data))
+
+
+def render(data):
+    lines = []
+    if "knobs" in data and "on" in data:
+        mode = data.get("mode") or ("eco" if data["on"] else "normal")
+        state = {"eco": "ECO ON", "max": "MAX ON"}.get(mode, "normal")
+        lines.append(f"  {state}   (PPD profile: {data.get('ppd_profile')}, "
+                     f"CPU avg {data.get('cpu_avg_mhz')} MHz)")
+        lines.append("")
+        for k in data["knobs"]:
+            tag = "[PPD]" if k["managed"] else ("[ECO]" if k["at_eco"] else "     ")
+            lines.append(f"  {tag} {k['label']:<24} {k['current_human']}")
+        before, after = data.get("power_before"), data.get("power_after")
+        if before is not None and after is not None:
+            delta = after - before
+            sign = "+" if delta > 0 else ""
+            lines.append("")
+            lines.append(f"  package power at apply: {before} W -> {after} W "
+                         f"({sign}{round(delta, 2)} W)")
+        c = data.get("cpu") or {}
+        if c.get("eff_pl1_w") is not None:
+            lines.append("")
+            lines.append(f"  CPU limits: PL1 {c['eff_pl1_w']:g} W, PL2 "
+                         f"{c.get('eff_pl2_w') or 0:g} W  (MSR {c.get('pl1_w')}/"
+                         f"{c.get('pl2_w')}, MMIO {c.get('mmio_pl1_w')}/"
+                         f"{c.get('mmio_pl2_w')})")
+        g = data.get("dgpu") or {}
+        if g.get("present"):
+            lines.append("")
+            holders = ", ".join(h["name"] for h in g.get("holders", [])) or "none"
+            draw = f"{g['power_w']} W" if g.get("power_w") is not None else "-"
+            lines.append(f"  dGPU: {g.get('runtime_status')} ({draw})  held by: {holders}")
+            q = g.get("gpu") or {}
+            if q:
+                lines.append(f"        {q.get('pstate')}, {q.get('util_pct')}% busy, "
+                             f"{q.get('temp_c')} °C, {q.get('gr_mhz')}/"
+                             f"{q.get('mem_mhz')} MHz, limit {q.get('limit_w')} W, "
+                             f"VRAM {q.get('vram_used_mib')}/{q.get('vram_total_mib')} MiB")
+            caps = g.get("caps") or {}
+            if caps:
+                state = ("locked" if caps.get("applied") else
+                         "waiting for the GPU to wake" if caps.get("pending") else
+                         caps.get("error") or "-")
+                lines.append(f"        Eco clock cap {caps.get('gr')} MHz"
+                             + (f", VRAM {caps['mem']} MHz" if caps.get("mem") else "")
+                             + f": {state}")
+    else:
+        lines.append(json.dumps(data, indent=2))
+    return "\n".join(lines)
+
+
+def charge_stop(text):
+    lo, hi = CHARGE_STOP_RANGE
+    if not (text.isascii() and text.isdigit()) or not lo <= int(text) <= hi:
+        raise argparse.ArgumentTypeError(f"must be a whole number {lo}..{hi}")
+    return int(text)
+
+
+def power_window(text):
+    """`power --seconds`: 1..10. The RAPL counter is root-only because fine
+    readings leak what other code does (PLATYPUS); without a password, one
+    averaged reading per second is as fine as it gets - the same as the
+    watts sampler's shortest interval."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    if not 1 <= value <= 10:
+        raise argparse.ArgumentTypeError("must be 1..10 seconds")
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="ecomode")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_on = sub.add_parser("on", help="enter ECO mode")
+    p_on.add_argument("--level", choices=LEVELS, default=DEFAULT_LEVEL,
+                      help="gentle = invisible to running apps (default); "
+                           "deep = also cap bursts, the frequency ceiling and "
+                           "the dGPU clock; deepest = lower still")
+    p_on.add_argument("--max-pct", type=int, default=DEFAULT_MAX_PCT,
+                      dest="max_pct",
+                      help="CPU ceiling percent for 'deep', 10..100 (default 40); "
+                           f"'deepest' uses at most {DEEPEST_MAX_PCT}")
+    p_on.set_defaults(func=cmd_on)
+
+    sub.add_parser("off", help="restore previous values").set_defaults(func=cmd_off)
+
+    p_st = sub.add_parser("status", help="show current state")
+    p_st.add_argument("--deep", action="store_true",
+                      help="also list dGPU holders and power draw "
+                           "(wakes the dGPU - not for polling)")
+    p_st.add_argument("--level", choices=LEVELS, default=DEFAULT_LEVEL,
+                      help="level to compare against when eco is off")
+    p_st.set_defaults(func=cmd_status)
+
+    sub.add_parser("selftest", help="verify applied state").set_defaults(func=cmd_selftest)
+
+    sub.add_parser("diagnostics",
+                   help="why ECO may be doing little right now"
+                   ).set_defaults(func=cmd_diagnostics)
+
+    p_pw = sub.add_parser("power", help="measure package watts (needs root)")
+    p_pw.add_argument("--seconds", type=power_window, default=1.0,
+                      help="sampling window, 1..10 s (default 1)")
+    p_pw.set_defaults(func=cmd_power)
+
+    p_ch = sub.add_parser("charge", help="battery charge limit (needs a "
+                          "charge_behaviour with inhibit-charge)")
+    p_ch.add_argument("action", choices=["on", "off"])
+    p_ch.add_argument("--stop", type=charge_stop, default=80,
+                      help=f"stop charging at this %%, "
+                           f"{CHARGE_STOP_RANGE[0]}..{CHARGE_STOP_RANGE[1]}; "
+                           f"resume {CHARGE_HYSTERESIS} below (default 80)")
+    p_ch.set_defaults(func=cmd_charge)
+
+    sub.add_parser("charge-run", help="internal: the charge limit service, "
+                   "started by systemd").set_defaults(func=cmd_charge_run)
+
+    sub.add_parser("gpu-guard", help="internal: keeps the dGPU clock cap, "
+                   "started by systemd").set_defaults(func=cmd_gpu_guard)
+
+    args = parser.parse_args()
+    if not args.cmd:
+        args.func = cmd_status
+        args.max_pct = DEFAULT_MAX_PCT
+        args.level = DEFAULT_LEVEL
+        args.deep = False
+
+    if args.cmd in ("on", "off", "gpu-guard", "charge", "charge-run") and os.geteuid() != 0:
+        print(f"ecomode: '{args.cmd}' needs root (run via pkexec)", file=sys.stderr)
+        return 2
+
+    # Without a password, root is not needed to read status or diagnostics -
+    # and as root they would show every user's GPU processes and debugfs.
+    if os.environ.get("PKEXEC_UID") and (
+            args.cmd == "diagnostics" or (args.cmd == "status" and args.deep)):
+        print(f"ecomode: run '{args.cmd}' without pkexec", file=sys.stderr)
+        return 2
+
+    lo, hi = MAX_PCT_RANGE
+    if args.cmd == "on" and not (lo <= args.max_pct <= hi):
+        print(f"ecomode: --max-pct must be {lo}..{hi}", file=sys.stderr)
+        return 2
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<policyconfig>
+  <!-- No password for the active local session. Through ecomode-max it can:
+       - start and stop Max, which holds the performance profile (as
+         power-profiles-daemon already lets that session do), with the fans
+         on auto, max (full speed) or boost (full speed while the CPU is
+         hot);
+       - when Max starts over Eco, roll Eco back to the originals Eco
+         recorded, through ecomode's own exact restore;
+       - start and stop nvidia-powerd (NVIDIA Dynamic Boost) together with
+         Max, only if it was not running already;
+       - start and stop the root watts sampler, which publishes an averaged
+         CPU package wattage, what limits the CPU right now (read-only MSR
+         0x64F) and, while another process keeps the dGPU awake, its load,
+         clocks and draw.
+       Every argument is checked; there are no free-form paths or values. -->
+  <action id="io.github.souloriginal.powermodes.max">
+    <description>Toggle Max power mode and the CPU watts sampler</description>
+    <message>Authentication is required to change the power mode</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/ecomode-max</annotate>
+  </action>
+</policyconfig>

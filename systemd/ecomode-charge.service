@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Unit]
+Description=Battery charge limit (ecomode)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ecomode charge-run
+Restart=on-failure
+RestartSec=30
+# Reads its setting and the battery, writes charge_behaviour. Nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+
+[Install]
+WantedBy=multi-user.target

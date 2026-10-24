@@ -1,0 +1,224 @@
+hp-wmi: battery charge behaviour for HP board 8BAB (WMI 0x2b, ACPI GBCC/SBCC)
+
+Adds charge_behaviour (auto, inhibit-charge) to the battery through a
+power_supply extension. Made against Linux 6.18.49.
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+--- a/drivers/platform/x86/hp/hp-wmi.c
++++ b/drivers/platform/x86/hp/hp-wmi.c
+@@ -255,6 +255,7 @@
+ 	HPWMI_FEATURE2_QUERY		= 0x0d,
+ 	HPWMI_WIRELESS2_QUERY		= 0x1b,
+ 	HPWMI_POSTCODEERROR_QUERY	= 0x2a,
++	HPWMI_BATTERY_CHARGE_MODE	= 0x2b,
+ 	HPWMI_SYSTEM_DEVICE_MODE	= 0x40,
+ 	HPWMI_THERMAL_PROFILE_QUERY	= 0x4c,
+ };
+@@ -2059,6 +2060,198 @@
+ 
+ static int hp_wmi_hwmon_init(void);
+ 
++#include <linux/bitfield.h>
++#include <acpi/battery.h>
++
++/*
++ * Battery charge behaviour (WMI command 0x2b, ACPI GBCC/SBCC on board 8BAB).
++ *
++ * SBCC takes the mode from bits 15:8 of the first data dword and sets EC
++ * flags: 0x00 clears them all (charge as usual), 0x05 sets SBIS (do not
++ * charge on AC). It also knows 0x02 (WACL: discharge on AC) and 0x06/0x07,
++ * which send EC command 0x45/0x20 and look like ship mode - neither is
++ * offered here. GBCC returns a status in byte 0: 0 auto, 1 charging,
++ * 2 discharging, 4/5/6 charging inhibited, 0xff no battery.
++ */
++#define HPWMI_CHARGE_MODE_MASK		GENMASK(15, 8)
++#define HPWMI_CHARGE_MODE_AUTO		0x00
++#define HPWMI_CHARGE_MODE_INHIBIT	0x05
++#define HPWMI_CHARGE_READ_MASK		GENMASK(7, 0)
++#define HPWMI_CHARGE_READ_NO_BATTERY	0xff
++/* The methods command 0x2b reaches on 8BAB; both must exist. */
++#define HPWMI_CHARGE_GET_METHOD		"\\_SB.WMID.GBCC"
++#define HPWMI_CHARGE_SET_METHOD		"\\_SB.WMID.SBCC"
++
++static const struct dmi_system_id hp_wmi_charge_boards[] = {
++	{
++		/* HP OMEN 16-wf0xxx: GBCC/SBCC read from its SSDT, BIOS F.29 */
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "HP"),
++			DMI_MATCH(DMI_BOARD_NAME, "8BAB"),
++		},
++	},
++	{}
++};
++
++static DEFINE_MUTEX(hp_wmi_charge_lock);
++
++static int hp_wmi_charge_status(void)
++{
++	u32 val = 0;
++	int ret;
++
++	ret = hp_wmi_perform_query(HPWMI_BATTERY_CHARGE_MODE, HPWMI_READ,
++				   &val, zero_if_sup(val), sizeof(val));
++	if (ret < 0)
++		return ret;
++	if (ret > 0)
++		return -EIO;
++	return FIELD_GET(HPWMI_CHARGE_READ_MASK, val);
++}
++
++static int hp_wmi_charge_status_to_behaviour(int status)
++{
++	switch (status) {
++	case 0x04:
++	case 0x05:
++	case 0x06:
++		return POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++	case 0x00:
++	case 0x01:
++	case 0x02:
++	case 0x03:
++		return POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int hp_wmi_charge_write(u32 mode)
++{
++	u32 val = FIELD_PREP(HPWMI_CHARGE_MODE_MASK, mode);
++	int ret;
++
++	ret = hp_wmi_perform_query(HPWMI_BATTERY_CHARGE_MODE, HPWMI_WRITE,
++				   &val, sizeof(val), 0);
++	if (ret < 0)
++		return ret;
++	return ret > 0 ? -EIO : 0;
++}
++
++static int hp_wmi_charge_get_property(struct power_supply *psy,
++				      const struct power_supply_ext *ext,
++				      void *data,
++				      enum power_supply_property psp,
++				      union power_supply_propval *val)
++{
++	int status, behaviour;
++
++	if (psp != POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR)
++		return -EINVAL;
++
++	guard(mutex)(&hp_wmi_charge_lock);
++	status = hp_wmi_charge_status();
++	if (status < 0)
++		return status;
++	behaviour = hp_wmi_charge_status_to_behaviour(status);
++	if (behaviour < 0)
++		return behaviour;
++	val->intval = behaviour;
++	return 0;
++}
++
++static int hp_wmi_charge_set_property(struct power_supply *psy,
++				      const struct power_supply_ext *ext,
++				      void *data,
++				      enum power_supply_property psp,
++				      const union power_supply_propval *val)
++{
++	if (psp != POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR)
++		return -EINVAL;
++
++	guard(mutex)(&hp_wmi_charge_lock);
++	switch (val->intval) {
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++		return hp_wmi_charge_write(HPWMI_CHARGE_MODE_AUTO);
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++		return hp_wmi_charge_write(HPWMI_CHARGE_MODE_INHIBIT);
++	default:
++		return -EINVAL;
++	}
++}
++
++static int hp_wmi_charge_property_is_writeable(struct power_supply *psy,
++					       const struct power_supply_ext *ext,
++					       void *data,
++					       enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
++}
++
++static const enum power_supply_property hp_wmi_charge_properties[] = {
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++};
++
++static const struct power_supply_ext hp_wmi_charge_ext = {
++	.name			= "hp-wmi-charge",
++	.properties		= hp_wmi_charge_properties,
++	.num_properties		= ARRAY_SIZE(hp_wmi_charge_properties),
++	.charge_behaviours	= BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++				  BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
++	.get_property		= hp_wmi_charge_get_property,
++	.set_property		= hp_wmi_charge_set_property,
++	.property_is_writeable	= hp_wmi_charge_property_is_writeable,
++};
++
++static int hp_wmi_charge_add_battery(struct power_supply *battery,
++				     struct acpi_battery_hook *hook)
++{
++	return power_supply_register_extension(battery, &hp_wmi_charge_ext,
++					       &hp_wmi_platform_dev->dev, NULL);
++}
++
++static int hp_wmi_charge_remove_battery(struct power_supply *battery,
++					struct acpi_battery_hook *hook)
++{
++	power_supply_unregister_extension(battery, &hp_wmi_charge_ext);
++	return 0;
++}
++
++static struct acpi_battery_hook hp_wmi_charge_hook = {
++	.add_battery	= hp_wmi_charge_add_battery,
++	.remove_battery	= hp_wmi_charge_remove_battery,
++	.name		= "HP WMI battery charge behaviour",
++};
++
++static void hp_wmi_charge_setup(struct platform_device *device)
++{
++	int status;
++
++	if (!dmi_check_system(hp_wmi_charge_boards))
++		return;
++	/*
++	 * The modes are what SBCC on this board does with them. Another BIOS
++	 * may route command 0x2b elsewhere, so the methods it was read from
++	 * must be there too.
++	 */
++	if (!acpi_has_method(NULL, HPWMI_CHARGE_GET_METHOD) ||
++	    !acpi_has_method(NULL, HPWMI_CHARGE_SET_METHOD)) {
++		dev_info(&device->dev, "battery charge behaviour: GBCC/SBCC not found\n");
++		return;
++	}
++	/* Only offered once the firmware answers a read sensibly. */
++	status = hp_wmi_charge_status();
++	if (status < 0 || hp_wmi_charge_status_to_behaviour(status) < 0) {
++		dev_info(&device->dev, "battery charge behaviour: no usable status (%d)\n",
++			 status);
++		return;
++	}
++	if (devm_battery_hook_register(&device->dev, &hp_wmi_charge_hook))
++		dev_warn(&device->dev, "battery charge behaviour: hook registration failed\n");
++	else
++		dev_info(&device->dev, "battery charge behaviour: status 0x%02x\n", status);
++}
++
+ static int __init hp_wmi_bios_setup(struct platform_device *device)
+ {
+ 	int err;
+@@ -2085,6 +2278,7 @@
+ 		return err;
+ 
+ 	thermal_profile_setup(device);
++	hp_wmi_charge_setup(device);
+ 
+ 	return 0;
+ }

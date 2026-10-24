@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="level" type="String">
+      <label>Tuning level: gentle, deep or deepest</label>
+      <default>gentle</default>
+    </entry>
+    <entry name="maxPct" type="Int">
+      <label>CPU ceiling percent used by the deep level</label>
+      <default>40</default>
+    </entry>
+    <entry name="pollSeconds" type="Int">
+      <label>Status refresh interval in seconds</label>
+      <default>10</default>
+    </entry>
+    <entry name="fansMode" type="String">
+      <label>Fans while Max is on: auto, max or boost (empty: the legacy fansMax decides)</label>
+      <default></default>
+    </entry>
+    <entry name="fansMax" type="Bool">
+      <label>Legacy: replaced by fansMode</label>
+      <default>false</default>
+    </entry>
+    <entry name="middleClick" type="String">
+      <label>What middle click toggles: last, max or eco</label>
+      <default>last</default>
+    </entry>
+    <entry name="lastMode" type="String">
+      <label>Last non-normal mode chosen (eco or max), used by middle click</label>
+      <default>max</default>
+    </entry>
+    <entry name="showWatts" type="Bool">
+      <label>Show CPU package watts in the panel (starts the root sampler)</label>
+      <default>false</default>
+    </entry>
+    <entry name="wattsSeconds" type="Int">
+      <label>Seconds between watts readings, 1..30</label>
+      <default>3</default>
+    </entry>
+    <entry name="wattsGpu" type="Bool">
+      <label>Add the dGPU's watts to the panel while something keeps it busy</label>
+      <default>true</default>
+    </entry>
+    <entry name="followProfile" type="Bool">
+      <label>Follow the KDE power profile: power-saver = Eco, balanced = Normal, performance = Max</label>
+      <default>false</default>
+    </entry>
+    <entry name="gpuBoost" type="Bool">
+      <label>Run NVIDIA Dynamic Boost (nvidia-powerd) while Max is on</label>
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>

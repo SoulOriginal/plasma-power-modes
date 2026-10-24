@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "io.github.souloriginal.powermodes",
+        "Name": "Power Modes",
+        "Description": "Eco, Normal and Max power modes with live CPU/GPU watts, GPU clock caps and a battery charge limit",
+        "Icon": "battery-profile-performance",
+        "Version": "1.0.0",
+        "License": "GPL-2.0-or-later",
+        "Category": "System Information",
+        "Authors": [{"Name": "SoulOriginal"}],
+        "Website": "https://github.com/SoulOriginal/plasma-power-modes",
+        "BugReportUrl": "https://github.com/SoulOriginal/plasma-power-modes/issues",
+        "MimeTypes": []
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml"
+}

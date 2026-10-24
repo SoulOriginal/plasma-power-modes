@@ -1,0 +1,1275 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""
+ecomode-max - keep an HP OMEN's EC in the performance profile.
+
+Why this exists
+---------------
+On HP OMEN 16-wf0 (board 8BAB) the embedded controller keeps a
+user-selected thermal profile for only 120 s after the last WMI
+0x20008/0x10 query, then falls back to its own ~44 W limits over PECI.
+RAPL keeps reading 130 W, so nothing in Linux shows the drop. hp-wmi on
+6.18 sends 0x10 only when platform_profile is written - but on every write,
+even of the same value. Rewriting the current profile every 30 s therefore
+holds the full limits. Measurements are in the README.
+
+Session-scoped by construction
+------------------------------
+`on` starts a transient systemd unit bound to the invoking user's manager
+(BindsTo=user@UID.service). With lingering on, that manager outlives the
+logout, so the keeper also asks logind every round whether the user is still
+logged in. Performance is held through a power-profiles-daemon profile hold,
+which the daemon never saves and drops by itself when the holder goes away.
+Nothing here survives a logout or a reboot.
+
+No password
+-----------
+The polkit action io.github.souloriginal.powermodes.max lets the active local session run
+this file without a password. That covers everything it does:
+- start and stop Max, with the fans on auto, max (full speed) or boost (full
+  speed while the CPU package is hot), and switch between them;
+- when Max starts over Eco, roll Eco back to the originals it recorded
+  (`ecomode off`, whose exact restore this reuses);
+- start and stop nvidia-powerd (NVIDIA Dynamic Boost) along with Max, if it
+  was not running already: it lifts the GPU's limit from 80 W to about
+  130 W in the performance profile (measured);
+- start and stop the root watts sampler, which publishes an averaged
+  package wattage, what limits the CPU right now (MSR 0x64F, read-only) and
+  - while some other process keeps the dGPU awake anyway - its load, clocks
+  and draw.
+run, cleanup and watts-run start under systemd only, and every argument is
+checked: there are no free-form paths or values.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import functools
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+import traceback
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ECO_PATH = os.path.join(HERE, "ecomode")
+SELF_PATH = os.path.join(HERE, "ecomode-max")
+
+
+def _load_ecomode():
+    """Reuse ecomode's sysfs helpers and paths instead of duplicating them."""
+    loader = importlib.machinery.SourceFileLoader("ecomode", ECO_PATH)
+    spec = importlib.util.spec_from_loader("ecomode", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# pkexec runs this as root: caching ecomode's bytecode would leave a
+# root-owned __pycache__ in /usr/local/bin.
+sys.dont_write_bytecode = True
+eco = _load_ecomode()
+
+KEEPALIVE_SECS = 30
+HOLD_PROFILE = "performance"
+HOLD_REASON = "Max power mode (EC keep-alive)"
+HOLD_APP_ID = "io.github.souloriginal.powermodes"
+
+# Fans. hp-wmi's pwm1_enable takes 0 (full speed) and 2 ("automatic"), and 2
+# is never written: on 6.18 it becomes WMI 0x10, 0x27 {0} and 0x2E {0x00,
+# 0x00}, and the EC on 8BAB takes 0x2E {0,0} literally and stops the fans.
+# It keeps them stopped for as long as 0x10 keeps arriving - and every
+# platform_profile write sends one, ours every 30 s and the daemon's when a
+# hold is taken or released. Measured: the fans stood still for a whole Max
+# session. So full speed is left only through silence: no hold and no
+# profile write for FAN_RELEASE_SECS, until the EC's 120 s timer runs out and
+# it takes the fans back to its own curve.
+FANS_MAX = "0"             # the only value ever written to pwm1_enable
+FANS_MODES = ("auto", "max", "boost")
+FAN_RELEASE_SECS = 125     # the EC drops user-defined fan state 120 s after the last 0x10
+BOOST_ON_C = 85            # boost: full speed at or above this package temperature
+BOOST_OFF_C = 65           # ...and hands back once it stays at or below this
+BOOST_COOL_SECS = 180      # ...for this long
+TEMP_POLL_SECS = 5         # boost only: how often the temperature is checked
+
+POWERD = "nvidia-powerd.service"
+GPU_SCAN_SECS = 30      # sampler: how often it looks who holds the dGPU
+
+WATTS_DEFAULT_S = 3
+WATTS_MIN_S, WATTS_MAX_S = 1, 30
+WATTS_SANE_MAX = 1000   # W; anything above is a counter glitch, not a reading
+
+
+class Keeper:
+    """The keep-alive state machine, free of I/O so it can be tested.
+
+    fans   "auto" never touches the fans, "max" runs them at full speed,
+           "boost" does so while the CPU package is hot (on_temp)
+    hw     read_profile() -> str|None, write_profile(v) -> (ok, err),
+           write_pwm(v) -> (ok, err), only ever with FANS_MAX,
+           on_ac() -> True|False|None, read_temp() -> °C|None
+    ppd    hold(profile, reason, app_id) -> cookie, release(cookie)
+    store  save(state), clear(), save_last(entry), stop_reason() -> str|None
+    clock  time() -> float
+    session alive() -> True|False|None: whether the user who started Max is
+           still logged in; None when logind could not say
+    settle seconds to stay silent before the first hold: an earlier session
+           left the fans at full speed and the EC has not taken them back
+    """
+
+    def __init__(self, fans, hw, ppd, store, clock, session, settle=0):
+        self.fans = fans
+        self.hw = hw
+        self.ppd = ppd
+        self.store = store
+        self.clock = clock
+        self.session = session
+        self.settle = settle
+        self.cookie = None
+        self.paused = False
+        self.profile_at_pause = None
+        self.running = False
+        self.state = {}
+        self._own_releases = set()
+        # Whether full speed is what we command right now.
+        self.fans_hot = fans == "max"
+        # When the EC lets go of full speed if no further 0x10 reaches it.
+        self.fans_armed_until = None
+        # While set, Max is silent so that the EC can take the fans back.
+        self.settle_until = None
+        self.cool_since = None      # boost: since when it has been cool
+
+    def now(self):
+        return int(self.clock.time())
+
+    def start(self, pid):
+        now = self.now()
+        if self.settle > 0:
+            # Until the EC has taken the fans back, any 0x10 from us would
+            # keep them at full speed; a stop meanwhile passes the rest on.
+            self.settle_until = now + self.settle
+            self.fans_armed_until = self.settle_until
+        self.state = {
+            "pid": pid, "since": now, "fans": self.fans,
+            "state": "starting", "pause_reason": None,
+            "last_tick": None, "last_tick_ok": None, "last_error": None,
+        }
+        self.running = True
+        return self.tick()
+
+    def tick(self):
+        """One keep-alive round. Returns False once the keeper has stopped."""
+        if not self.running or self._logged_out():
+            return False
+        # No mains supply to ask (None) counts as AC: pausing on such a
+        # reading would quietly switch the mode off.
+        if self.hw.on_ac() is False:
+            # Nothing is watched on battery, so a cool spell that began
+            # before starts over once AC is back.
+            self.cool_since = None
+            self._pause("battery")
+        elif self.settle_until is not None and self.now() < self.settle_until:
+            self._pause("fans settling")
+        else:
+            self.settle_until = None
+            self._keep_alive()
+        if self.running:
+            self._save()
+        return self.running
+
+    def _logged_out(self):
+        """Ends Max once logind says the user is gone. With lingering on,
+        the user manager - and BindsTo= with it - outlives the logout, so
+        every round asks, paused or settling alike. Only a definite answer
+        counts: a question logind left unanswered (None) ends nothing."""
+        if self.session.alive() is False:
+            self.stop("logout or shutdown")
+            return True
+        return False
+
+    def _save(self):
+        self.state.update(fans_state="max" if self.fans_hot else "auto",
+                          settle_until=self.settle_until,
+                          fans_armed_until=self.fans_armed_until)
+        self.store.save(self.state)
+
+    def _reached_ec(self):
+        """A hold, a release (the daemon writes the profile for both), a
+        profile rewrite or a fan write has just reached the EC: at full
+        speed, that keeps the fans there FAN_RELEASE_SECS past now."""
+        if self.fans_hot:
+            self.fans_armed_until = self.now() + FAN_RELEASE_SECS
+
+    def _keep_alive(self):
+        if self.paused:
+            # A profile picked by hand while we were paused is the user's
+            # decision; taking performance back would override it.
+            if self.hw.read_profile() != self.profile_at_pause:
+                self.stop("profile changed")
+                return
+            self.paused = False
+
+        fresh = False
+        if self.cookie is None:
+            try:
+                self.cookie = self.ppd.hold(HOLD_PROFILE, HOLD_REASON, HOLD_APP_ID)
+            except Exception as exc:      # D-Bus errors share no useful base
+                self.stop(f"hold failed: {exc}")
+                return
+            fresh = True
+
+        errors = []
+        profile = self.hw.read_profile()
+        if not fresh and profile is not None and profile != HOLD_PROFILE:
+            # Held since an earlier tick, yet the profile moved. The hold is
+            # gone without a signal (daemon restart) or someone overrode it.
+            # Claiming "holding performance" from here on would be a lie.
+            self._release()
+            self.stop("profile changed")
+            return
+        if profile is None:
+            errors.append("platform_profile unreadable")
+        else:
+            # Rewriting the same value is the point: every write makes
+            # hp-wmi send the 0x10 query that restarts the EC's 120 s timer.
+            ok, err = self.hw.write_profile(profile)
+            if not ok:
+                errors.append(f"platform_profile: {err}")
+        if self.fans_hot:
+            ok, err = self.hw.write_pwm(FANS_MAX)
+            if not ok:
+                errors.append(f"pwm1_enable: {err}")
+        self._reached_ec()
+        self.state.update(state="active", pause_reason=None,
+                          last_tick=self.now(), last_tick_ok=not errors,
+                          last_error="; ".join(errors) or None)
+
+    def _pause(self, reason):
+        # No fan write here or anywhere on the way out: the only "back to
+        # automatic" there is, pwm1_enable=2, stops the fans (see FANS_MAX).
+        if not self.paused:
+            self._release()
+            self.paused = True
+            self.profile_at_pause = self.hw.read_profile()
+            self.state.update(last_tick_ok=True, last_error=None)
+        self.state.update(state="paused", pause_reason=reason,
+                          last_tick=self.now())
+
+    def _release(self):
+        if self.cookie is None:
+            return
+        cookie, self.cookie = self.cookie, None
+        self._own_releases.add(cookie)
+        try:
+            self.ppd.release(cookie)
+        except Exception:                 # the daemon may already be gone
+            pass
+        self._reached_ec()
+
+    def on_temp(self, temp_c):
+        """Boost: cmd_run hands in the package temperature every
+        TEMP_POLL_SECS. Nothing is decided without a reading, nor on battery,
+        where nothing is sent to the EC anyway."""
+        if (self.fans != "boost" or not self.running or temp_c is None
+                or self.state.get("pause_reason") == "battery"):
+            return
+        if self.settle_until is not None:
+            if temp_c >= BOOST_ON_C:
+                # Hot again before the EC took the fans back: they are still
+                # at full speed, so keep them there and resume at once.
+                self.settle_until = None
+                self.fans_hot = True
+                self.tick()
+            return
+        if not self.fans_hot:
+            # Nothing is run up for a session that has already ended.
+            if temp_c >= BOOST_ON_C and not self._logged_out():
+                self.fans_hot = True
+                self.cool_since = None
+                ok, err = self.hw.write_pwm(FANS_MAX)
+                self._reached_ec()
+                if not ok:
+                    self.state.update(last_tick_ok=False,
+                                      last_error=f"pwm1_enable: {err}")
+                self._save()
+            return
+        if temp_c > BOOST_OFF_C:
+            self.cool_since = None
+            return
+        if self.cool_since is None:
+            self.cool_since = self.now()
+        if self.now() - self.cool_since >= BOOST_COOL_SECS:
+            self._hand_back()
+
+    def _hand_back(self):
+        """Boost has cooled down. There is no fan write that means
+        "automatic" (see FANS_MAX), so Max falls silent until the EC takes
+        the fans back, then carries on without them."""
+        self._pause("fans settling")      # releasing at full speed: one more 0x10
+        self.fans_hot = False
+        self.cool_since = None
+        self.settle_until = self.now() + FAN_RELEASE_SECS
+        self._save()
+
+    def on_released(self, cookie):
+        """power-profiles-daemon dropped a hold of ours.
+
+        Our own release (pausing on battery) echoes back here and must not
+        end the mode. Any other release of our cookie means the user picked
+        a profile by hand, which ends Max.
+        """
+        if cookie in self._own_releases:
+            self._own_releases.discard(cookie)
+            return
+        if cookie == self.cookie:
+            self.cookie = None
+            self._reached_ec()            # the daemon wrote the picked profile
+            self.stop("profile changed")
+
+    def on_resume(self):
+        """Back from suspend: the EC may have reset, so do not wait 30 s."""
+        self.tick()
+
+    def on_terminate(self):
+        self.stop(self.store.stop_reason() or "logout or shutdown")
+
+    def stop(self, reason):
+        if not self.running:
+            return
+        self.running = False
+        self._release()
+        self.store.clear()
+        now, armed = self.now(), self.fans_armed_until
+        # A session that leaves the fans at full speed says until when: the
+        # next one with auto or boost stays silent that long (cmd_on).
+        self.store.save_last({
+            "ended_at": now, "reason": reason,
+            "fans_armed_until": armed if armed is not None and armed > now else None})
+
+
+class WattMeter:
+    """Average package power between consecutive RAPL energy readings.
+
+    Pure arithmetic, so it can be tested: the caller supplies the counter
+    value and a clock that keeps running through suspend (CLOCK_BOOTTIME).
+    """
+
+    def __init__(self, range_uj, max_gap):
+        self.range_uj = range_uj    # the counter wraps here; None if unknown
+        self.max_gap = max_gap      # seconds; a longer gap is a suspend or stall
+        self.last = None
+
+    def feed(self, energy_uj, t):
+        """Watts since the previous reading, or None when there is no
+        trustworthy figure: the first reading, a clock that did not advance,
+        a gap long enough to span a suspend, a counter that ran backwards
+        with no known range, or a glitch above WATTS_SANE_MAX."""
+        prev, self.last = self.last, (energy_uj, t)
+        if prev is None:
+            return None
+        dt = t - prev[1]
+        if dt <= 0 or dt > self.max_gap:
+            # After a suspend the counter may have been reset; folding a
+            # reset over the range would produce a plausible-looking lie.
+            return None
+        de = energy_uj - prev[0]
+        if de < 0:
+            if not self.range_uj:
+                return None
+            de += self.range_uj         # the counter wrapped
+        watts = de / dt / 1_000_000
+        if watts > WATTS_SANE_MAX:
+            return None
+        return round(watts, 1)
+
+
+# ---------------------------------------------------------------------------
+# real collaborators
+# ---------------------------------------------------------------------------
+
+UNIT = "ecomode-max.service"
+WATTS_UNIT = "ecomode-watts.service"
+PPD_BUS_NAME = "org.freedesktop.UPower.PowerProfiles"
+PPD_PATH = "/org/freedesktop/UPower/PowerProfiles"
+PPD_IFACE = "org.freedesktop.UPower.PowerProfiles"
+LOGIND_BUS_NAME = "org.freedesktop.login1"
+LOGIND_PATH = "/org/freedesktop/login1"
+LOGIND_IFACE = "org.freedesktop.login1.Manager"
+LOGIND_USER_IFACE = "org.freedesktop.login1.User"
+LOGIND_NO_SUCH_USER = "org.freedesktop.login1.NoSuchUser"
+# logind's User.State, as whether the user is still logged in. Logging out
+# with lingering on leaves "closing", then "lingering". Any other value is
+# one this file does not know, and is treated as no answer.
+USER_LOGGED_IN = {"active": True, "online": True,
+                  "lingering": False, "closing": False, "offline": False}
+
+
+def _write_json(path, data):
+    eco.make_state_dir()         # every file written here lives in STATE_DIR
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+class FileStore:
+    """State files under /run/ecomode - tmpfs, so gone after a reboot."""
+
+    def save(self, state):
+        _write_json(eco.MAX_STATE_FILE, state)
+
+    def clear(self):
+        for path in (eco.MAX_STATE_FILE, eco.MAX_STOP_FLAG):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def save_last(self, entry):
+        _write_json(eco.MAX_LAST_FILE, entry)
+
+    def stop_reason(self):
+        return eco.read_path(eco.MAX_STOP_FLAG)
+
+
+class SysfsHw:
+    def __init__(self, hwmon_dir):
+        self.pwm_path = f"{hwmon_dir}/pwm1_enable" if hwmon_dir else None
+
+    def read_profile(self):
+        return eco.read_path(eco.PLATFORM_PROFILE)
+
+    def write_profile(self, value):
+        return eco.write_path(eco.PLATFORM_PROFILE, value)
+
+    def write_pwm(self, value):
+        # The one place pwm1_enable is written: full speed or nothing, since
+        # 2 stops the fans on this EC (see FANS_MAX).
+        if value != FANS_MAX:
+            return False, f"refusing pwm1_enable={value}"
+        if not self.pwm_path:
+            return False, "no hp fan control"
+        return eco.write_path(self.pwm_path, value)
+
+    def on_ac(self):
+        return eco.on_ac()
+
+    def read_temp(self):
+        return eco.pkg_temp_c()
+
+
+def _gio():
+    # Imported lazily: the Keeper and the CLI checks load without PyGObject.
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib
+
+
+def _signal_add():
+    """GLibUnix.signal_add, or GLib.unix_signal_add on an older GLib.
+
+    PyGObject on GLib 2.88 deprecates the latter and would log a warning on
+    every keeper start.
+    """
+    import gi
+    _, GLib = _gio()
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        return GLibUnix.signal_add
+    except (ImportError, ValueError):
+        return GLib.unix_signal_add
+
+
+class DbusPpd:
+    def __init__(self, bus):
+        self.bus = bus
+
+    def _call(self, method, params, reply):
+        Gio, GLib = _gio()
+        return self.bus.call_sync(
+            PPD_BUS_NAME, PPD_PATH, PPD_IFACE, method, params,
+            GLib.VariantType.new(reply) if reply else None,
+            Gio.DBusCallFlags.NONE, 5000, None)
+
+    def hold(self, profile, reason, app_id):
+        _, GLib = _gio()
+        params = GLib.Variant("(sss)", (profile, reason, app_id))
+        return self._call("HoldProfile", params, "(u)").unpack()[0]
+
+    def release(self, cookie):
+        _, GLib = _gio()
+        self._call("ReleaseProfile", GLib.Variant("(u)", (cookie,)), None)
+
+
+def dbus_error_name(exc):
+    """The D-Bus error behind a GLib.Error, e.g.
+    org.freedesktop.login1.NoSuchUser; None for anything else."""
+    try:
+        Gio, _ = _gio()
+        return Gio.DBusError.get_remote_error(exc)
+    except Exception:                     # not a GLib.Error, or no GLib at all
+        return None
+
+
+class LogindSession:
+    """Whether a user is still logged in, as logind tells it over the bus.
+
+    The keeper asks this every round: BindsTo=user@UID.service alone misses
+    the logout when lingering keeps the user manager running. The keeper
+    has a GLib loop and a bus connection anyway; the sampler, which has
+    neither, asks through libsystemd instead (SdLoginSession). Nothing here
+    reads logind's private files under /run/systemd/users itself.
+    """
+
+    def __init__(self, bus, uid):
+        self.bus = bus
+        self.uid = uid
+        self.unsure_logged = False
+
+    def _call(self, path, iface, method, params, reply):
+        Gio, GLib = _gio()
+        return self.bus.call_sync(
+            LOGIND_BUS_NAME, path, iface, method, params,
+            GLib.VariantType.new(reply), Gio.DBusCallFlags.NONE, 2000,
+            None).unpack()[0]
+
+    def alive(self):
+        """True while logged in, False once logged out (lingering or not),
+        None when logind could not say."""
+        try:
+            _, GLib = _gio()
+            path = self._call(LOGIND_PATH, LOGIND_IFACE, "GetUser",
+                              GLib.Variant("(u)", (self.uid,)), "(o)")
+            state = self._call(path, "org.freedesktop.DBus.Properties", "Get",
+                               GLib.Variant("(ss)", (LOGIND_USER_IFACE, "State")),
+                               "(v)")
+        except Exception as exc:
+            if dbus_error_name(exc) == LOGIND_NO_SUCH_USER:
+                return False              # not logged in, not lingering either
+            self._unsure(exc)
+            return None
+        logged_in = USER_LOGGED_IN.get(state)
+        if logged_in is None:
+            self._unsure(f"unknown user state {state!r}")
+        return logged_in
+
+    def _unsure(self, why):
+        # A D-Bus hiccup must not end a mode, only a definite answer can; but
+        # the journal should say once that the check is not working.
+        if not self.unsure_logged:
+            self.unsure_logged = True
+            print(f"ecomode-max: cannot tell from logind whether uid {self.uid} "
+                  f"is logged in ({why}); carrying on", file=sys.stderr, flush=True)
+
+
+# libsystemd's ABI name. ctypes.util.find_library() would run ldconfig in a
+# subprocess just to arrive at the same name.
+SD_LOGIN_LIB = "libsystemd.so.0"
+_sd_login = None        # (sd_uid_get_state, free) once loaded; False if it cannot be
+
+
+def _sd_login_fns():
+    """libsystemd's sd_uid_get_state() and libc's free(), loaded on first use
+    and kept; None when libsystemd cannot be loaded (tried once)."""
+    global _sd_login
+    if _sd_login is None:
+        import ctypes
+        try:
+            get_state = ctypes.CDLL(SD_LOGIN_LIB).sd_uid_get_state
+            get_state.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+            get_state.restype = ctypes.c_int
+            free = ctypes.CDLL(None).free       # the free that pairs with its malloc
+            free.argtypes = [ctypes.c_void_p]
+            free.restype = None
+            _sd_login = (get_state, free)
+        except (OSError, AttributeError):
+            _sd_login = False
+    return _sd_login or None
+
+
+def uid_state_native(uid):
+    """logind's state for uid through sd_uid_get_state(), sd-login's public
+    call over logind's own per-user state: "active", "online", "lingering",
+    "closing", "offline" (also for a uid logind has never seen) or a word
+    added later. None when libsystemd is missing or the call fails."""
+    fns = _sd_login_fns()
+    if fns is None:
+        return None
+    import ctypes
+    get_state, free = fns
+    out = ctypes.c_void_p()
+    if get_state(uid, ctypes.byref(out)) < 0 or not out.value:
+        return None
+    try:
+        return ctypes.string_at(out.value).decode("ascii", "replace")
+    finally:
+        free(out.value)                   # libsystemd's copy is ours to free
+
+
+class SdLoginSession:
+    """The sampler's session check: LogindSession's answer, read in-process
+    through libsystemd. The sampler wakes every few seconds and needs no
+    main loop; PyGObject and a bus connection for one question per round
+    cost it about 13 MB of resident memory (21 -> 34 MB, measured)."""
+
+    def __init__(self, uid, read_state=None):
+        self.uid = uid
+        self.read_state = read_state or uid_state_native
+        self.unsure_logged = False
+
+    def alive(self):
+        """True while logged in, False once logged out (lingering or not),
+        None when there is no answer."""
+        try:
+            state = self.read_state(self.uid)
+        except Exception as exc:          # never let the check end the loop
+            state, why = None, exc
+        else:
+            why = "no answer from libsystemd" if state is None else \
+                f"unknown user state {state!r}"
+        logged_in = USER_LOGGED_IN.get(state)
+        if logged_in is None and not self.unsure_logged:
+            self.unsure_logged = True
+            print(f"ecomode-max: cannot tell from logind whether uid {self.uid} "
+                  f"is logged in ({why}); carrying on", file=sys.stderr, flush=True)
+        return logged_in
+
+
+def ppd_available():
+    try:
+        Gio, GLib = _gio()
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        reply = bus.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "NameHasOwner", GLib.Variant("(s)", (PPD_BUS_NAME,)),
+            GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 2000, None)
+        return reply.unpack()[0]
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+@contextlib.contextmanager
+def state_lock():
+    """An exclusive flock on /run/ecomode/lock for as long as a command runs.
+
+    Root's alone (0600 in a root-owned directory), so no other user can take
+    it and stall Max. The kernel lets go when the file is closed, and so when
+    the process dies, too.
+    """
+    eco.make_state_dir()
+    fd = os.open(os.path.join(eco.STATE_DIR, "lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def locked(command):
+    """Runs a command from start to end under state_lock().
+
+    on, off and watts each read what runs and then act on it. Run side by
+    side - Plasma's Apply sets two options one after the other, two widgets
+    start at login, clicks come quickly - they act on each other's stale
+    view: "unit already loaded", or an old interval that sticks.
+    """
+    @functools.wraps(command)
+    def run(args):
+        with state_lock():
+            # `ecomode off`, run from in here, takes the same lock; it must
+            # not wait for the one its parent holds.
+            os.environ[eco.LOCK_HELD_ENV] = "1"
+            try:
+                return command(args)
+            finally:
+                os.environ.pop(eco.LOCK_HELD_ENV, None)
+    return run
+
+
+def invoking_uid():
+    """The user behind pkexec (or sudo): whose session Max belongs to."""
+    for var in ("PKEXEC_UID", "SUDO_UID"):
+        value = os.environ.get(var, "")
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def unit_active():
+    return sh(["systemctl", "is-active", "--quiet", UNIT]).returncode == 0
+
+
+def watts_active():
+    return sh(["systemctl", "is-active", "--quiet", WATTS_UNIT]).returncode == 0
+
+
+def watts_entry(meter, interval, boottime, walltime, gpu=None):
+    """One sampler round: the record to publish, or None when this round has
+    no trustworthy reading."""
+    raw = eco.read_path(f"{eco.RAPL}/energy_uj")
+    if not raw or not raw.isdigit():
+        return None
+    watts = meter.feed(int(raw), boottime)
+    if watts is None:
+        return None
+    return {"cpu_w": watts, "battery_w": eco.battery_draw_w(),
+            "cpu_limit": eco.cpu_limit_now(),
+            "gpu": gpu.reading() if gpu is not None else None,
+            "at": int(walltime), "interval": interval}
+
+
+# What the sampler publishes of a GPU reading.
+GPU_SAMPLE_KEYS = ("power_w", "limit_w", "util_pct", "temp_c", "gr_mhz",
+                   "mem_mhz", "pstate", "reasons")
+
+
+class GpuWatch:
+    """The sampler's view of the dGPU.
+
+    Asking the driver keeps the GPU awake, and the sampler asks every few
+    seconds: if nothing else used the card, the sampler alone could keep it
+    from ever powering down. So it asks only while some *other* process
+    holds the GPU, which keeps it awake anyway. Who holds it is looked up
+    every GPU_SCAN_SECS (a walk over /proc), and again as soon as the GPU
+    wakes.
+    """
+
+    def __init__(self, clock=time.monotonic, scan_secs=GPU_SCAN_SECS):
+        self.clock = clock
+        self.scan_secs = scan_secs
+        self.last_scan = None
+        self.held = False
+
+    def reading(self):
+        status = eco.gpu_runtime()["status"]
+        if status != "active":
+            self.last_scan = None         # rescan the moment it wakes
+            self.held = False
+            return {"state": status}
+        now = self.clock()
+        if self.last_scan is None or now - self.last_scan >= self.scan_secs:
+            self.last_scan = now
+            self.held = bool(eco.keeps_awake(eco.gpu_holders(exclude={os.getpid()})))
+        if not self.held:
+            return {"state": "active", "held": False}
+        q = eco.gpu_query() or {}
+        out = {k: q.get(k) for k in GPU_SAMPLE_KEYS}
+        out.update(state="active", held=True)
+        return out
+
+
+def powerd_present():
+    res = sh(["systemctl", "show", "-p", "LoadState", "--value", POWERD])
+    return res.returncode == 0 and res.stdout.strip() == "loaded"
+
+
+def start_powerd():
+    """Start Dynamic Boost for Max, unless it runs already - then it is not
+    ours to stop later. Returns an error, or None."""
+    if os.path.exists(eco.POWERD_FLAG):
+        return None
+    if sh(["systemctl", "is-active", "--quiet", POWERD]).returncode == 0:
+        return None
+    if not powerd_present():
+        return "nvidia-powerd is not installed"
+    res = sh(["systemctl", "start", POWERD])
+    if res.returncode != 0:
+        return "nvidia-powerd: " + ((res.stderr or "").strip() or "did not start")
+    eco.make_state_dir()
+    with open(eco.POWERD_FLAG, "w") as fh:
+        fh.write("max")
+    os.chmod(eco.POWERD_FLAG, 0o644)
+    return None
+
+
+def stop_powerd():
+    """Stop Dynamic Boost if Max started it; leave it alone otherwise."""
+    if not os.path.exists(eco.POWERD_FLAG):
+        return
+    sh(["systemctl", "stop", POWERD])
+    try:
+        os.remove(eco.POWERD_FLAG)
+    except OSError:
+        pass
+
+
+def user_manager_active(uid):
+    return sh(["systemctl", "is-active", "--quiet",
+               f"user@{uid}.service"]).returncode == 0
+
+
+def transient_unit_cmd(unit, description, uid, stop_post, argv):
+    """systemd-run for a root helper that lives only as long as the user's
+    session: bound to their manager, locked down, writing only /run/ecomode."""
+    user_unit = f"user@{uid}.service"
+    return [
+        "systemd-run", f"--unit={unit}", "--collect", "--quiet",
+        f"--description={description}",
+        "-p", f"BindsTo={user_unit}", "-p", f"After={user_unit}",
+        "-p", "After=power-profiles-daemon.service",
+        "-p", f"ExecStopPost={stop_post}",
+        "-p", "NoNewPrivileges=yes", "-p", "ProtectHome=yes",
+        "-p", "PrivateTmp=yes", "-p", "ProtectSystem=strict",
+        "-p", f"ReadWritePaths={eco.STATE_DIR}",
+        "--", *argv,
+    ]
+
+
+def systemd_run_cmd(uid, fans, settle):
+    return transient_unit_cmd(UNIT, "HP OMEN Max power keep-alive", uid,
+                              f"{SELF_PATH} cleanup",
+                              [SELF_PATH, "run", "--uid", str(uid),
+                               "--fans", fans, "--settle", str(settle)])
+
+
+def settle_for(fans, last, now):
+    """Seconds a new session stays silent before its first hold.
+
+    `last` is the previous session's end record. If that session left the
+    fans at full speed, any 0x10 before the EC has taken them back keeps
+    them there - fine for "max", not for "auto" or "boost".
+    """
+    armed = (last or {}).get("fans_armed_until")
+    # Written as whole seconds by this file; anything else is not ours.
+    if fans == "max" or isinstance(armed, bool) or not isinstance(armed, int):
+        return 0
+    # Never more than one hand-back: it runs from the last 0x10, which cannot
+    # lie ahead of now, so a longer wait only means the clock was set back.
+    return max(0, min(math.ceil(armed - now), FAN_RELEASE_SECS))
+
+
+def watts_run_cmd(uid, interval):
+    return transient_unit_cmd(WATTS_UNIT, "CPU package watts sampler", uid,
+                              f"-/usr/bin/rm -f {eco.WATTS_FILE}",
+                              [SELF_PATH, "watts-run", "--uid", str(uid),
+                               "--interval", str(interval)])
+
+
+def fail(args, reason):
+    eco.emit({"ok": False, "reason": reason}, args)
+    return 1
+
+
+def wait_for_state(timeout=3.0, step=0.1):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = eco.max_state()
+        # "paused" covers a keeper that starts by letting the fans settle.
+        if state and state.get("state") in ("active", "paused"):
+            return state
+        time.sleep(step)
+    return None
+
+
+def stop_unit(reason):
+    """Stop the service, first telling the keeper why so its record is right.
+
+    The reason goes in its own file: the keeper rewrites max.json every tick
+    and would overwrite a flag kept there.
+    """
+    eco.make_state_dir()
+    with open(eco.MAX_STOP_FLAG, "w") as fh:
+        fh.write(reason)
+    sh(["systemctl", "stop", UNIT])
+
+
+@locked
+def cmd_on(args):
+    uid = invoking_uid()
+    if uid is None:
+        return fail(args, "cannot tell which user asked; run through pkexec")
+    supported, why = eco.max_support()
+    if not supported:
+        return fail(args, why)
+    if args.fans in ("max", "boost") and not eco.fans_controllable():
+        return fail(args, "no hp fan control (hwmon 'hp' with pwm1_enable)")
+    if args.fans == "boost" and eco.pkg_temp_c() is None:
+        return fail(args, "no CPU package temperature sensor")
+    if not ppd_available():
+        return fail(args, "power-profiles-daemon is not running")
+    if not user_manager_active(uid):
+        return fail(args, f"no running session for uid {uid}")
+
+    boost = getattr(args, "gpu_boost", False)
+    running = eco.max_state()
+    if running and running.get("fans") == args.fans:
+        boost_error = start_powerd() if boost else stop_powerd()
+        eco.emit({"ok": True, "noop": True, "state": eco.max_public(running),
+                  "gpu_boost": os.path.exists(eco.POWERD_FLAG),
+                  "gpu_boost_error": boost_error}, args)
+        return 0
+    if running or unit_active():
+        stop_unit("restart")
+
+    if eco.is_on():
+        # Already root, so reuse the exact-restore path of `ecomode off`
+        # rather than duplicating it here.
+        res = sh([ECO_PATH, "--json", "off"])
+        if res.returncode != 0:
+            detail = (res.stdout or "").strip() or (res.stderr or "").strip()
+            return fail(args, "could not restore eco first: " + detail)
+
+    # Read before it goes below: it may say the EC still holds the fans at
+    # full speed - also for the session stopped just above.
+    settle = settle_for(args.fans, eco.read_json(eco.MAX_LAST_FILE), time.time())
+    FileStore().clear()
+    eco.make_state_dir()
+    sh(["systemctl", "reset-failed", UNIT])
+    # Only this start's own end record explains a failure. An older one (an
+    # earlier session's "off", or the "restart" the unit stopped above wrote
+    # a moment ago) would send the user chasing the wrong cause, so it goes.
+    try:
+        os.remove(eco.MAX_LAST_FILE)
+    except OSError:
+        pass
+    res = sh(systemd_run_cmd(uid, args.fans, settle))
+    if res.returncode != 0:
+        return fail(args, "systemd-run failed: " + (res.stderr or "").strip())
+
+    state = wait_for_state()
+    if state is None:
+        last = eco.read_json(eco.MAX_LAST_FILE) or {}
+        return fail(args, last.get("reason") or "keep-alive did not start")
+    # Dynamic Boost is extra: Max runs without it, the widget says why not.
+    boost_error = start_powerd() if boost else None
+    if eco.max_state() is None:
+        # The keeper ended in the meantime and its cleanup has run already;
+        # nothing would stop a daemon started after it.
+        stop_powerd()
+    eco.emit({"ok": True, "state": eco.max_public(state),
+              "gpu_boost": os.path.exists(eco.POWERD_FLAG),
+              "gpu_boost_error": boost_error}, args)
+    return 0
+
+
+@locked
+def cmd_off(args):
+    if eco.max_state() is None and not unit_active():
+        stop_powerd()             # left behind by a Max that ended as it started
+        eco.emit({"ok": True, "noop": True, "msg": "max is already off"}, args)
+        return 0
+    stop_unit("off")
+    if unit_active():
+        eco.emit({"ok": False, "msg": "service did not stop"}, args)
+        return 1
+    # No keeper runs without its unit, so a max.json still here is stale: its
+    # keeper died without cleaning up, and a live pid in it is someone else's.
+    FileStore().clear()
+    stop_powerd()                 # cleanup did it already, unless it failed
+    eco.emit({"ok": True, "msg": "stopped"}, args)
+    return 0
+
+
+def from_systemd():
+    """run, cleanup and watts-run are started by systemd only; pkexec clears
+    the environment, so INVOCATION_ID cannot be carried in through it."""
+    if os.environ.get("INVOCATION_ID"):
+        return True
+    print("ecomode-max: 'run', 'cleanup' and 'watts-run' are started by "
+          "systemd only", file=sys.stderr)
+    return False
+
+
+class KeeperLoop:
+    """cmd_run's GLib callbacks around a Keeper.
+
+    GLib only prints an exception raised in a callback, and a timeout whose
+    callback raised is dropped for good: the keep-alive would stop while
+    max.json still said Max runs. So an unexpected error ends Max, with the
+    error as its reason, and quits the loop; the traceback goes to the
+    journal.
+    """
+
+    def __init__(self, keeper, hw, loop):
+        self.keeper = keeper
+        self.hw = hw
+        self.loop = loop
+        self.failed = False
+
+    def _carry_on(self):
+        if not self.keeper.running:
+            self.loop.quit()
+        return self.keeper.running
+
+    def _fail(self, exc):
+        traceback.print_exc()
+        self.failed = True
+        try:
+            self.keeper.stop(f"internal error: {exc}")
+        except Exception:                 # cleanup's crash record still follows
+            traceback.print_exc()
+        self.loop.quit()
+        return False
+
+    def on_tick(self):
+        try:
+            self.keeper.tick()
+            return self._carry_on()
+        except Exception as exc:
+            return self._fail(exc)
+
+    def on_temp_tick(self):
+        try:
+            self.keeper.on_temp(self.hw.read_temp())
+            return self._carry_on()
+        except Exception as exc:
+            return self._fail(exc)
+
+    def on_released(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            self.keeper.on_released(params.unpack()[0])
+            self._carry_on()
+        except Exception as exc:
+            self._fail(exc)
+
+    def on_sleep(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            if not params.unpack()[0]:    # False: the machine just resumed
+                self.keeper.on_resume()
+                self._carry_on()
+        except Exception as exc:
+            self._fail(exc)
+
+    def on_signal(self):
+        try:
+            self.keeper.on_terminate()
+        except Exception as exc:
+            return self._fail(exc)
+        self.loop.quit()
+        return False
+
+
+def cmd_run(args):
+    if not from_systemd():
+        return 2
+    if not 0 <= args.settle <= FAN_RELEASE_SECS:
+        return 2
+    hwmon = eco.find_hp_hwmon()
+    if args.fans in ("max", "boost") and hwmon is None:
+        now = int(time.time())
+        FileStore().save_last({
+            "ended_at": now, "reason": "unsupported: no hp fan control",
+            # The wait this start inherited still applies to the next one.
+            "fans_armed_until": now + args.settle if args.settle else None})
+        return 1
+
+    Gio, GLib = _gio()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    hw = SysfsHw(hwmon)
+    keeper = Keeper(args.fans, hw, DbusPpd(bus), FileStore(), time,
+                    LogindSession(bus, args.uid), settle=args.settle)
+    loop = GLib.MainLoop()
+    glue = KeeperLoop(keeper, hw, loop)
+
+    # Only the daemons themselves may end or wake Max. Any local process can
+    # send a signal, and a ProfileReleased cookie is a small number.
+    bus.signal_subscribe(PPD_BUS_NAME, PPD_IFACE, "ProfileReleased", PPD_PATH,
+                         None, Gio.DBusSignalFlags.NONE, glue.on_released)
+    bus.signal_subscribe(LOGIND_BUS_NAME, LOGIND_IFACE, "PrepareForSleep",
+                         LOGIND_PATH, None, Gio.DBusSignalFlags.NONE, glue.on_sleep)
+    add_signal = _signal_add()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        add_signal(GLib.PRIORITY_DEFAULT, signum, glue.on_signal)
+
+    if not keeper.start(os.getpid()):
+        return 1
+    GLib.timeout_add_seconds(KEEPALIVE_SECS, glue.on_tick)
+    if args.fans == "boost":
+        # Only boost looks at the temperature; auto and max add no wake-ups.
+        GLib.timeout_add_seconds(TEMP_POLL_SECS, glue.on_temp_tick)
+    loop.run()
+    return 1 if glue.failed else 0
+
+
+def crash_armed_until(state, now):
+    """fans_armed_until for a keeper that died without writing its record:
+    the one it last published - unless it was holding the profile at full
+    speed, when the daemon's revert on the lost hold was one more 0x10."""
+    armed = state.get("fans_armed_until")
+    hot = "max" in (state.get("fans_state"), state.get("fans"))
+    if hot and state.get("state") == "active":
+        armed = now + FAN_RELEASE_SECS
+    if isinstance(armed, bool) or not isinstance(armed, int) or armed <= now:
+        return None
+    return armed
+
+
+def cmd_cleanup(args):
+    """ExecStopPost: runs after every stop of the unit, clean or not."""
+    if not from_systemd():
+        return 2
+    state = eco.read_json(eco.MAX_STATE_FILE)
+    if state is not None:
+        # The keeper did not get to clean up after itself: it crashed or was
+        # killed. The daemon already dropped the hold along with the D-Bus
+        # connection. The fans are left alone - the only "automatic" to
+        # write would stop them (see FANS_MAX); the record says how long the
+        # EC may still hold them at full speed, and the next session waits.
+        now = int(time.time())
+        result = os.environ.get("SERVICE_RESULT", "unknown")
+        FileStore().save_last({"ended_at": now,
+                               "reason": f"stopped unexpectedly ({result})",
+                               "fans_armed_until": crash_armed_until(state, now)})
+    FileStore().clear()
+    # However Max ended - off, restart, a picked profile, logout, a crash -
+    # Dynamic Boost it started goes with it.
+    stop_powerd()
+    return 0
+
+
+@locked
+def cmd_watts(args):
+    if args.action == "off":
+        if not watts_active():
+            eco.emit({"ok": True, "noop": True,
+                      "msg": "watts sampler is already off"}, args)
+            return 0
+        sh(["systemctl", "stop", WATTS_UNIT])
+        still = watts_active()
+        eco.emit({"ok": not still,
+                  "msg": "sampler did not stop" if still else "stopped"}, args)
+        return 1 if still else 0
+
+    if not WATTS_MIN_S <= args.interval <= WATTS_MAX_S:
+        return fail(args, f"--interval must be {WATTS_MIN_S}..{WATTS_MAX_S} seconds")
+    uid = invoking_uid()
+    if uid is None:
+        return fail(args, "cannot tell which user asked; run through pkexec")
+    if not os.path.exists(f"{eco.RAPL}/energy_uj"):
+        return fail(args, "no RAPL package energy counter on this machine")
+    if not user_manager_active(uid):
+        return fail(args, f"no running session for uid {uid}")
+
+    if watts_active():
+        current = eco.read_json(eco.WATTS_FILE) or {}
+        if current.get("interval") == args.interval:
+            eco.emit({"ok": True, "noop": True, "interval": args.interval}, args)
+            return 0
+        sh(["systemctl", "stop", WATTS_UNIT])
+
+    eco.make_state_dir()
+    sh(["systemctl", "reset-failed", WATTS_UNIT])
+    res = sh(watts_run_cmd(uid, args.interval))
+    if res.returncode != 0:
+        return fail(args, "systemd-run failed: " + (res.stderr or "").strip())
+    eco.emit({"ok": True, "interval": args.interval}, args)
+    return 0
+
+
+def cmd_watts_run(args):
+    """The sampler loop: one averaged reading per interval into WATTS_FILE,
+    for as long as the user is logged in."""
+    if not from_systemd():
+        return 2
+    if not WATTS_MIN_S <= args.interval <= WATTS_MAX_S:
+        return 2
+    rng = eco.read_path(f"{eco.RAPL}/max_energy_range_uj")
+    meter = WattMeter(int(rng) if rng and rng.isdigit() else None,
+                      max_gap=3 * args.interval)
+    gpu = GpuWatch() if os.path.exists(eco.DGPU) else None
+    session = SdLoginSession(args.uid)
+
+    def on_term(_signum, _frame):
+        sys.exit(0)                 # interrupts the sleep; `finally` cleans up
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    try:
+        # Lingering keeps the user manager, and BindsTo= with it, past the
+        # logout; logind's state is read every round, as the keeper asks it.
+        while session.alive() is not False:
+            entry = watts_entry(meter, args.interval,
+                                time.clock_gettime(time.CLOCK_BOOTTIME),
+                                time.time(), gpu)
+            if entry is not None:
+                _write_json(eco.WATTS_FILE, entry)
+            time.sleep(args.interval)
+        return 0
+    finally:
+        # The temp file too: a SIGTERM can land between writing and renaming.
+        for path in (eco.WATTS_FILE, eco.WATTS_FILE + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def user_id(text):
+    """--uid of run and watts-run: whose session the loop belongs to. A plain
+    positive number that logind's 32-bit uid can carry: never root, and
+    never (uid_t)-1."""
+    if not (text.isascii() and text.isdigit()) or not 0 < int(text) < 2**32 - 1:
+        raise argparse.ArgumentTypeError(f"not a user id: {text!r}")
+    return int(text)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ecomode-max",
+        description="Hold an HP OMEN in performance for this session only.")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_on = sub.add_parser("on", help="start Max (ends on logout or reboot)")
+    p_on.add_argument("--fans", choices=FANS_MODES, default="auto",
+                      help="auto: the firmware's curve; max: full speed; "
+                           f"boost: full speed from {BOOST_ON_C} C")
+    p_on.add_argument("--gpu-boost", action="store_true", dest="gpu_boost",
+                      help="also run nvidia-powerd (Dynamic Boost) while Max is on")
+    p_on.set_defaults(func=cmd_on)
+
+    sub.add_parser("off", help="stop Max").set_defaults(func=cmd_off)
+
+    p_run = sub.add_parser("run", help="internal: the keep-alive, started by systemd")
+    p_run.add_argument("--uid", type=user_id, required=True,
+                       help="the user whose session Max belongs to")
+    p_run.add_argument("--fans", choices=FANS_MODES, default="auto")
+    p_run.add_argument("--settle", type=int, default=0,
+                       help="seconds of silence first, while the EC takes back "
+                            "fans an earlier session left at full speed")
+    p_run.set_defaults(func=cmd_run)
+
+    sub.add_parser("cleanup", help="internal: ExecStopPost of the unit"
+                   ).set_defaults(func=cmd_cleanup)
+
+    p_w = sub.add_parser("watts", help="CPU watts sampler for the widget (session only)")
+    p_w.add_argument("action", choices=["on", "off"])
+    p_w.add_argument("--interval", type=int, default=WATTS_DEFAULT_S,
+                     help=f"seconds between readings, {WATTS_MIN_S}..{WATTS_MAX_S}")
+    p_w.set_defaults(func=cmd_watts)
+
+    p_wr = sub.add_parser("watts-run", help="internal: the sampler, started by systemd")
+    p_wr.add_argument("--uid", type=user_id, required=True,
+                      help="the user whose session the sampler belongs to")
+    p_wr.add_argument("--interval", type=int, default=WATTS_DEFAULT_S)
+    p_wr.set_defaults(func=cmd_watts_run)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    if os.geteuid() != 0:
+        print("ecomode-max: needs root (run through pkexec)", file=sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

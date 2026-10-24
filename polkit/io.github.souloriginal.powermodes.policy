@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<policyconfig>
+  <!-- No password for the active local session, so that the widget can
+       follow the KDE power profile and put Eco back after the firmware
+       undoes it on a profile change. Through ecomode that session can:
+       - turn Eco on at one of three levels (gentle, deep, deepest) with a
+         CPU ceiling of 20..100 %, which lowers CPU power limits, the CPU
+         frequency ceiling and the dGPU's clocks;
+       - turn it off, which writes back exactly the values Eco recorded;
+       - turn the battery charge limit on (stop at 50..95 %) or off, which
+         enables or disables the ecomode-charge service; it only ever
+         writes "auto" or "inhibit-charge" to charge_behaviour;
+       - read the CPU energy counter averaged over 1..10 s windows, no finer
+         than the watts sampler publishes (`on` samples 1 s windows too; the
+         counter itself stays root-only). One command at a time: they share
+         a lock.
+       Every argument is an enum or a bounded number; there are no free-form
+       paths or values. gpu-guard runs under systemd only. Inactive and
+       remote sessions still need an administrator. -->
+  <action id="io.github.souloriginal.powermodes">
+    <description>Toggle Eco power tuning</description>
+    <message>Authentication is required to change CPU power tuning</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/ecomode</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
