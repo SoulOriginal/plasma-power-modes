@@ -1196,6 +1196,23 @@ def is_sensor_follower(pid, name):
     return name == "nvidia-smi" and _comm(_ppid(pid)) == "ksystemstats"
 
 
+# The desktop itself. Xorg (also SDDM's greeter, which stays up after login),
+# KWin and Xwayland keep /dev/nvidia* open for as long as they run - KWin 6.7
+# opens every GPU it finds - yet the card powers down with them there. They
+# keep it awake only while it drives a display. Counting them as holders made
+# the watts sampler ask the driver every few seconds, and that did keep the
+# card awake: measured, it slept 2 s after the sampler stopped.
+DESKTOP_HOLDERS = ("Xorg", "kwin_wayland", "Xwayland")
+
+
+def holder_keeps_awake(name, hits, driving):
+    """Whether a process with these dGPU nodes open keeps the card awake.
+    `driving`: a display is connected to the dGPU."""
+    if not any(t.startswith("/dev/nvidia") for t in hits):
+        return False                  # the DRM card node alone never does
+    return driving or name not in DESKTOP_HOLDERS
+
+
 def holder_note(pid, name, awake):
     """Why a holder is there, when the name alone does not say."""
     if is_sensor_follower(pid, name):
@@ -1203,10 +1220,12 @@ def holder_note(pid, name, awake):
                 "a widget shows a GPU sensor")
     if name == "nvidia-smi":
         return f"started by {_comm(_ppid(pid))}"
+    if not awake and name in DESKTOP_HOLDERS:
+        return "the desktop: holds the card but lets it sleep (no display on it)"
     if not awake:
         return "display node only: does not keep it awake"
-    if name in ("Xwayland", "kwin_wayland"):
-        return "the desktop renders on the GPU"
+    if name in DESKTOP_HOLDERS:
+        return "the desktop drives a display on the GPU"
     return None
 
 
@@ -1214,13 +1233,13 @@ def gpu_holders(exclude=()):
     """Processes holding a dGPU node. As a user this sees the user's own
     processes; as root, all of them.
 
-    `awake`: it has a /dev/nvidia* node open, i.e. is a client of the
-    driver, which is what keeps the card out of D3cold. A process with only
-    the DRM card node open (Xwayland, the compositor) does not: the card has
-    been seen asleep with those running. `follower`: KDE's GPU sensor, which
-    a gated widget runs only while something else keeps the card awake.
+    `awake`: it keeps the card out of D3cold (holder_keeps_awake): a client
+    of the driver (/dev/nvidia*), unless it is the desktop and no display is
+    on the dGPU. `follower`: KDE's GPU sensor, which a gated widget runs only
+    while something else keeps the card awake.
     """
     nodes = dgpu_nodes()
+    driving = bool(dgpu_connectors())
     by_name = {}
     for pid_dir in globmod.glob("/proc/[0-9]*"):
         pid = int(os.path.basename(pid_dir))
@@ -1241,7 +1260,7 @@ def gpu_holders(exclude=()):
         if not hits:
             continue
         name = _comm(pid)
-        awake = any(t.startswith("/dev/nvidia") for t in hits)
+        awake = holder_keeps_awake(name, hits, driving)
         entry = by_name.get(name)
         if entry is None:
             by_name[name] = {"pid": pid, "name": name, "count": 1, "awake": awake,

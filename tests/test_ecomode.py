@@ -1229,6 +1229,21 @@ for text, ok in (("80", True), ("50", True), ("95", True), ("49", False), ("96",
     check(f"charge --stop {text}: {'allowed' if ok else 'refused'}", good is ok)
 
 
+# ── Who keeps the dGPU awake ─────────────────────────────────────────────────
+print("\n\033[1m22a. dGPU holders\033[0m")
+K = eco.holder_keeps_awake
+NV = {"/dev/nvidia0", "/dev/nvidiactl"}
+check("an app with the driver open keeps it awake", K("blender", NV, False) is True)
+check("the DRM card node alone never does", K("Xwayland", {"/dev/dri/card0"}, True) is False)
+check("the desktop with the driver open, no display on the dGPU: lets it sleep",
+      not K("kwin_wayland", NV, False) and not K("Xorg", NV, False)
+      and not K("Xwayland", NV, False))
+check("the desktop driving a display on the dGPU: keeps it awake",
+      K("kwin_wayland", NV, True) and K("Xorg", NV, True))
+check("the note says why the desktop is listed",
+      "lets it sleep" in eco.holder_note(1, "kwin_wayland", False)
+      and "drives a display" in eco.holder_note(1, "kwin_wayland", True))
+
 # ── Battery care log: what the journal says, and the chart's history ────────
 print("\n\033[1m22b. battery care log\033[0m")
 CONF = {"enabled": True, "stop": 80, "log": True}
