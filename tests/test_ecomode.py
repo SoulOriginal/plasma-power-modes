@@ -1237,7 +1237,7 @@ check("an app with the driver open keeps it awake", K("blender", NV, False) is T
 check("the DRM card node alone never does", K("Xwayland", {"/dev/dri/card0"}, True) is False)
 check("the desktop with the driver open, no display on the dGPU: lets it sleep",
       not K("kwin_wayland", NV, False) and not K("Xorg", NV, False)
-      and not K("Xwayland", NV, False))
+      and not K("Xwayland", NV, False) and not K("plasmashell", NV, False))
 check("the desktop driving a display on the dGPU: keeps it awake",
       K("kwin_wayland", NV, True) and K("Xorg", NV, True))
 check("the note says why the desktop is listed",

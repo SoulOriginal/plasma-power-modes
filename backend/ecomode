@@ -1197,12 +1197,13 @@ def is_sensor_follower(pid, name):
 
 
 # The desktop itself. Xorg (also SDDM's greeter, which stays up after login),
-# KWin and Xwayland keep /dev/nvidia* open for as long as they run - KWin 6.7
-# opens every GPU it finds - yet the card powers down with them there. They
+# KWin, Xwayland and the Plasma shell keep /dev/nvidia* open for as long as
+# they run - KWin 6.7 opens every GPU it finds, and plasmashell loads NVIDIA's
+# EGL and Vulkan at start - yet the card powers down with them there. They
 # keep it awake only while it drives a display. Counting them as holders made
 # the watts sampler ask the driver every few seconds, and that did keep the
 # card awake: measured, it slept 2 s after the sampler stopped.
-DESKTOP_HOLDERS = ("Xorg", "kwin_wayland", "Xwayland")
+DESKTOP_HOLDERS = ("Xorg", "kwin_wayland", "Xwayland", "plasmashell")
 
 
 def holder_keeps_awake(name, hits, driving):
