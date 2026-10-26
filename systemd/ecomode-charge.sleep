@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# systemd-sleep hook for Battery care. Nothing keeps the charge limit while
+# the machine is suspended, so charging is held before a suspend and the
+# service puts the old mode back after it. Does nothing while Battery care
+# is off. Its lines join the service's: journalctl -t ecomode-charge
+[ -x /usr/local/bin/ecomode ] || exit 0
+case "$1" in
+    pre|post)
+        /usr/local/bin/ecomode charge-sleep "$1" "$2" 2>&1 | systemd-cat -t ecomode-charge
+        ;;
+esac
+exit 0

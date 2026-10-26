@@ -661,6 +661,24 @@ Item {
                     allowed: !root.busy
                     onPicked: function(id) { root.setChargeLimit(true, parseInt(id)) }
                 }
+                Toggle {
+                    visible: !!(laptop.bat && laptop.bat.limit)
+                    enabled: !root.busy
+                    text: "Battery care log"
+                    hint: laptop.bat && laptop.bat.limit_log
+                        ? "Every decision and its reason goes to journalctl -t ecomode-charge; "
+                          + "7 days are kept for the chart"
+                        : "Off: only the stop and resume lines are logged"
+                    on: !!(laptop.bat && laptop.bat.limit_log)
+                    onToggled: function(want) { root.setChargeLog(want) }
+                }
+                ChargeChart {
+                    visible: root.chargeLogOn
+                    Layout.topMargin: Kirigami.Units.smallSpacing
+                    history: root.chargeHistory
+                    hours: root.chargeHours
+                    onHoursPicked: function(h) { root.chargeHours = h }
+                }
             }
 
             // ── Eco knobs ────────────────────────────────────────────────────

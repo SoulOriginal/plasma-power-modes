@@ -14,6 +14,7 @@ PLASMOID_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/plasma/plasmoids"
 BIN=/usr/local/bin
 POLKIT=/usr/share/polkit-1/actions
 UNIT=/etc/systemd/system/ecomode-charge.service
+SLEEP_HOOK=/usr/lib/systemd/system-sleep/ecomode-charge
 
 say()  { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*"; }
@@ -45,7 +46,7 @@ uninstall() {
         sudo "$BIN/ecomode-max" watts off >/dev/null 2>&1 || true
     fi
     sudo systemctl disable --now ecomode-charge.service >/dev/null 2>&1 || true
-    sudo rm -f "$UNIT" "$BIN/ecomode" "$BIN/ecomode-max" \
+    sudo rm -f "$UNIT" "$SLEEP_HOOK" "$BIN/ecomode" "$BIN/ecomode-max" \
         "$POLKIT/$APPLET_ID.policy" "$POLKIT/$APPLET_ID.max.policy"
     sudo rm -rf /var/lib/ecomode
     sudo systemctl daemon-reload
@@ -109,8 +110,14 @@ sudo install -Dm644 "$SRC/polkit/$APPLET_ID.max.policy" "$POLKIT/$APPLET_ID.max.
 say "helpers   $BIN/ecomode, $BIN/ecomode-max"
 # Installed always, enabled only by the Battery care switch.
 sudo install -Dm644 "$SRC/systemd/ecomode-charge.service" "$UNIT"
+sudo install -Dm755 "$SRC/systemd/ecomode-charge.sleep" "$SLEEP_HOOK"
 sudo systemctl daemon-reload
+# A running service keeps the old code until it is restarted.
+if systemctl is-active --quiet ecomode-charge.service; then
+    sudo systemctl restart ecomode-charge.service
+fi
 say "service   $UNIT (off until Battery care is switched on)"
+say "sleep     $SLEEP_HOOK (holds charging while suspended)"
 
 # ── 4. They must answer ─────────────────────────────────────────────────────
 "$BIN/ecomode" --json status | python3 -c \

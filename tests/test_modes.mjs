@@ -295,4 +295,50 @@ t("gpu cap on a sleeping card is not claimed as locked", () => assert.equal(
 t("gpu cap locked while awake", () => assert.equal(
     m.gpuCapText({ gr: 900, mem: null, applied: true }, "active"), "≤ 900 MHz: locked"))
 
+// ── Battery care log and chart ──────────────────────────────────────────────
+t("charge: log on", () => assert.equal(m.chargeCommand("/h", true, 80, true),
+    "pkexec /h --json charge on --stop 80 --log on"))
+t("charge: log off with the limit off", () => assert.equal(m.chargeCommand("/h", false, 80, false),
+    "pkexec /h --json charge off --log off"))
+t("charge: log not given is kept", () => assert.equal(m.chargeCommand("/h", true, 70),
+    "pkexec /h --json charge on --stop 70"))
+t("history command: 24 h, or 7 days, nothing else",
+  () => assert.deepEqual([m.chargeHistoryCommand("/h", 168), m.chargeHistoryCommand("/h", "1; rm")],
+                         ["/h --json charge-history --hours 168", "/h --json charge-history --hours 24"]))
+
+const H = 3600
+const rows = [
+    [0, 60, true, "auto", "Charging", "start"],
+    [H, 80, true, "inhibit-charge", "Charging", "stop"],
+    [H + 10, 80, true, "inhibit-charge", "Not charging", null],
+    [2 * H, 79, false, "auto", "Discharging", "unplug"],
+    [3 * H, 70, false, "inhibit-charge", "Discharging", "sleep"],
+    [5 * H, 68, false, "auto", "Discharging", "wake"],
+    [8 * H, 50, null, null, "Unknown", "start"],
+]
+const s = m.chargeSeries(rows, 9 * H, 24)
+t("chart: steps hold the charge until the next change, with its state", () => assert.deepEqual(
+    s.steps.slice(0, 3).map(x => [x.t0, x.t1, x.cap, x.state]),
+    [[0, H, 60, "charging"], [H, H + 10, 80, "charging"], [H + 10, 2 * H, 80, "held"]]))
+t("chart: asleep is a band, not a line", () => {
+    assert.deepEqual(s.sleeps, [{ t0: 3 * H, t1: 5 * H }])
+    assert.ok(!s.steps.some(x => x.t0 === 3 * H))
+})
+t("chart: before a service start a reading lasts an hour at most", () =>
+    assert.equal(s.steps.find(x => x.cap === 68).t1, 6 * H))
+t("chart: the last reading runs to now", () => assert.equal(s.steps[s.steps.length - 1].t1, 9 * H))
+t("chart: markers only for stop and resume", () =>
+    assert.deepEqual(s.marks.map(x => x.event), ["stop"]))
+t("chart: what is older than the window is clipped, not dropped", () => {
+    const w = m.chargeSeries(rows, 29.5 * H, 24)
+    assert.deepEqual([w.steps[0].t0, w.steps[0].cap], [5.5 * H, 68])
+})
+t("chart: nothing to show", () => assert.deepEqual(m.chargeSeries(null, 100, 24).steps, []))
+t("hover: the reading in force at a moment", () =>
+    assert.equal(m.chargeAt(rows, H + 5)[1], 80))
+t("hover text", () => {
+    const txt = m.chargeHoverText(rows[1], 24)
+    assert.match(txt, /^\d\d:\d\d · 80 % · charging · charging stopped at the limit$/)
+})
+
 console.log(`\n${passed} passed`)

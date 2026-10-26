@@ -642,6 +642,23 @@ CHARGE_STOP_RANGE = (50, 95)
 CHARGE_HYSTERESIS = 5
 CHARGE_SECS = 30
 CHARGE_AUTO, CHARGE_INHIBIT = "auto", "inhibit-charge"
+# Battery care log (off by default): every decision, with its reason, goes to
+# the journal under the identifier ecomode-charge (`journalctl -t
+# ecomode-charge`), and a compact history - one line per change, never a
+# timer's worth - feeds the popup's chart. Seven days are kept; the file is
+# trimmed in place, so it stays one file of a few dozen KB.
+CHARGE_HISTORY = os.path.join(CHARGE_DIR, "charge-history")
+CHARGE_HISTORY_DAYS = 7
+CHARGE_STEP = 5               # a log line per 5 % while charging or discharging
+CHARGE_HEARTBEAT = 3600       # and one an hour when nothing else happened
+CHARGE_CONFIRM_SECS = 120     # firmware that has not followed a write by then
+# Written by the sleep hook before suspend, marked "woke" after; the service
+# then puts the pre-sleep charge mode back and removes it.
+CHARGE_SLEEP_FILE = os.path.join(CHARGE_DIR, "charge-sleep.json")
+# Charging is held over a suspend only on AC and from this level up. Lower,
+# it charges as usual while asleep (possibly to 100 %), so a laptop put to
+# sleep nearly flat does not wake up nearly flat.
+CHARGE_SLEEP_FLOOR = 50
 
 
 def find_battery():
@@ -681,7 +698,8 @@ def load_charge_conf():
     lo, hi = CHARGE_STOP_RANGE
     if isinstance(stop, bool) or not isinstance(stop, int) or not lo <= stop <= hi:
         stop = 80
-    return {"enabled": conf.get("enabled") is True, "stop": stop}
+    return {"enabled": conf.get("enabled") is True, "stop": stop,
+            "log": conf.get("log") is True}
 
 
 def save_charge_conf(conf):
@@ -726,6 +744,7 @@ def battery_info():
         "charge_supported": CHARGE_AUTO in offered and CHARGE_INHIBIT in offered,
         "limit": conf if conf["enabled"] else None,
         "limit_stop": conf["stop"],
+        "limit_log": conf["log"],
     }
     if power and now is not None:
         if status == "Discharging":
@@ -771,6 +790,212 @@ def charge_round():
         return None, None
     ok, err = write_path(f"{bat}/charge_behaviour", want)
     return (want, None) if ok else (None, f"{want}: {err}")
+
+
+# ── Battery care log ────────────────────────────────────────────────────────
+
+def charge_snapshot(bat):
+    """What the log and the chart need from one reading of the battery."""
+    current, _ = parse_behaviour(read_path(f"{bat}/charge_behaviour"))
+    power = _uw(f"{bat}/power_now")
+    return {"cap": _uw(f"{bat}/capacity"), "ac": on_ac(), "mode": current,
+            "status": read_path(f"{bat}/status"),
+            "power_w": round(power / 1e6, 1) if power else None}
+
+
+def duration_text(secs):
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs} s"
+    h, m = divmod(secs // 60, 60)
+    return f"{h} h {m:02d} min" if h else f"{m} min"
+
+
+def battery_state_text(s):
+    """"charging at 31.2 W, on AC" and the like - one reading, in words."""
+    power = f" at {s['power_w']} W" if s.get("power_w") else ""
+    src = "on AC" if s.get("ac") is True else "on battery" if s.get("ac") is False else "power source unknown"
+    st = s.get("status")
+    if st == "Charging":
+        what = "charging" + power
+    elif st == "Discharging":
+        what = "discharging" + power
+    elif s.get("mode") == CHARGE_INHIBIT and s.get("ac") is True:
+        what = "held, not charging"
+    else:
+        what = (st or "unknown status").lower()
+    return f"{what}, {src}"
+
+
+# One letter per field keeps a history line about 25 bytes.
+_HIST_STATUS = {"Charging": "C", "Discharging": "D", "Not charging": "N", "Full": "F"}
+_HIST_STATUS_BACK = {v: k for k, v in _HIST_STATUS.items()}
+
+
+def history_line(t, s, event=None):
+    ac = {True: "1", False: "0"}.get(s.get("ac"), "-")
+    mode = {CHARGE_AUTO: "a", CHARGE_INHIBIT: "i"}.get(s.get("mode"), "-")
+    cap = s.get("cap")
+    return (f"{int(t)} {cap if cap is not None else '-'} {ac} {mode} "
+            f"{_HIST_STATUS.get(s.get('status'), 'U')} {event or '-'}\n")
+
+
+def parse_history_line(line):
+    """[t, capacity, ac, mode, status, event] or None for a damaged line."""
+    parts = line.split()
+    if len(parts) != 6:
+        return None
+    try:
+        t = int(parts[0])
+        cap = None if parts[1] == "-" else int(parts[1])
+    except ValueError:
+        return None
+    return [t, cap, {"1": True, "0": False}.get(parts[2]),
+            {"a": CHARGE_AUTO, "i": CHARGE_INHIBIT}.get(parts[3]),
+            _HIST_STATUS_BACK.get(parts[4], "Unknown"),
+            None if parts[5] == "-" else parts[5]]
+
+
+def history_append(t, s, event=None):
+    """One line onto the history; under a lock, since the sleep hook writes
+    too. A failed write costs a chart point, nothing else."""
+    try:
+        os.makedirs(CHARGE_DIR, exist_ok=True)
+        fd = os.open(CHARGE_HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        with os.fdopen(fd, "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.write(history_line(t, s, event))
+    except OSError:
+        pass
+
+
+def history_trim(now, days=CHARGE_HISTORY_DAYS):
+    """Drop what is older than `days`, rewriting the file in place."""
+    cutoff = now - days * 86400
+    try:
+        with open(CHARGE_HISTORY, "r+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            lines = fh.readlines()
+            keep = [ln for ln in lines
+                    if (p := parse_history_line(ln)) is not None and p[0] >= cutoff]
+            if len(keep) != len(lines):
+                fh.seek(0)
+                fh.writelines(keep)
+                fh.truncate()
+    except OSError:
+        pass
+
+
+def history_read(since):
+    try:
+        with open(CHARGE_HISTORY) as fh:
+            rows = [parse_history_line(ln) for ln in fh]
+    except OSError:
+        return []
+    return [r for r in rows if r is not None and r[0] >= since]
+
+
+class ChargeWatch:
+    """Turns successive readings into log lines that say what happened and
+    why, plus a history event name for the chart. Pure: the caller reads the
+    battery and the clock, and prints what comes back."""
+
+    def __init__(self):
+        self.prev = None
+        self.bucket = None          # capacity // CHARGE_STEP at the last step line
+        self.last_line = 0.0
+        self.pending = None         # (mode written, when) until the firmware follows
+
+    def observe(self, now, cur, written, conf, slept=False, sleeping=False):
+        """(lines, event): lines for the journal, event for the history (or
+        None when nothing worth a chart point changed). `slept`: the machine
+        has just woken, and the sleep hook has logged it; `sleeping`: the hook
+        has held charging for a suspend that is under way."""
+        stop, resume = conf["stop"], conf["stop"] - CHARGE_HYSTERESIS
+        cap, prev = cur.get("cap"), self.prev
+        lines, event = [], None
+        if prev is None:
+            lines.append(f"watching: limit {stop} %, resume at {resume} %; "
+                         f"battery {cap} %, {battery_state_text(cur)}")
+            event = "start"
+        elif slept:
+            # The sleep hook has already said what it did; only start afresh.
+            event = "wake"
+        else:
+            if cur["ac"] != prev["ac"]:
+                if cur["ac"] is True:
+                    lines.append(f"AC plugged in at {cap} %" + (
+                        f": charging up to {stop} %" if cap is not None and cap < stop
+                        else f": at or above the {stop} % limit, holding"))
+                    event = "plug"
+                else:
+                    lines.append(f"AC unplugged at {cap} %: running on battery")
+                    event = "unplug"
+            elif cur["mode"] != prev["mode"] and written is None and not sleeping:
+                lines.append(f"warning: charge_behaviour changed outside this service: "
+                             f"{prev['mode']} -> {cur['mode']} at {cap} %")
+                event = "outside"
+        if written == CHARGE_INHIBIT:
+            lines.append(f"charging stopped at {cap} %: reached the {stop} % limit "
+                         f"(charge_behaviour = inhibit-charge); resumes at {resume} %")
+            event = "stop"
+        elif written == CHARGE_AUTO and not conf["enabled"]:
+            lines.append(f"limit switched off at {cap} %: charging normally to 100 %")
+            event = "off"
+        elif written == CHARGE_AUTO and cur["ac"] is True:
+            lines.append(f"charging resumed at {cap} %: down to the {resume} % resume level "
+                         f"(charge_behaviour = auto); stops again at {stop} %")
+            event = "resume"
+        elif written == CHARGE_AUTO:
+            lines.append(f"charge hold cleared at {cap} %: not needed on battery "
+                         f"(charge_behaviour = auto)")
+            event = event or "clear"
+        if written:
+            self.pending = (written, now)
+        lines += self._confirm(now, cur)
+        # Every CHARGE_STEP % while the charge moves; one line an hour else.
+        bucket = cap // CHARGE_STEP if cap is not None else None
+        moving = cur.get("status") in ("Charging", "Discharging")
+        if prev is not None and not slept and bucket != self.bucket and moving and not lines:
+            lines.append(f"battery {cap} %, {battery_state_text(cur)}")
+        if slept:
+            self.last_line = now     # asleep is not "no change": count afresh
+        if not lines and now - self.last_line >= CHARGE_HEARTBEAT:
+            lines.append(f"no change for {duration_text(now - self.last_line)}: "
+                         f"battery {cap} %, {battery_state_text(cur)}")
+            # A chart point too: the chart trusts a reading for an hour.
+            event = "" if event is None else event
+        if lines:
+            self.last_line = now
+            self.bucket = bucket
+        if event is None and (prev is None or any(
+                cur.get(k) != prev.get(k) for k in ("cap", "ac", "mode", "status"))):
+            event = ""              # a plain chart point, no named event
+        self.prev = dict(cur)
+        return lines, event
+
+    def _confirm(self, now, cur):
+        """Did the battery follow the last write? Says so once, with how long
+        it took, or warns once when it has not after CHARGE_CONFIRM_SECS."""
+        if self.pending is None:
+            return []
+        mode, since = self.pending
+        if cur.get("mode") != mode or cur.get("ac") is not True:
+            self.pending = None          # overtaken, or unplugged: nothing to confirm
+            return []
+        st = cur.get("status")
+        took = duration_text(now - since)
+        if mode == CHARGE_INHIBIT and st != "Charging":
+            self.pending = None
+            return [f"firmware followed: battery {st.lower() if st else 'idle'} after {took}"]
+        if mode == CHARGE_AUTO and st in ("Charging", "Full"):
+            self.pending = None
+            return [f"firmware followed: battery {st.lower()} after {took}"]
+        if now - since >= CHARGE_CONFIRM_SECS:
+            self.pending = None
+            return [f"warning: charge_behaviour is {mode} but the battery still reports "
+                    f"{st} after {took}"]
+        return []
 
 
 def pkg_temp_c():
@@ -1259,6 +1484,12 @@ def guard_round(now=None):
         return True
 
 
+def conf_log(args):
+    """--log on/off, or what was saved when it is not given."""
+    want = getattr(args, "log", None)
+    return load_charge_conf()["log"] if want is None else want == "on"
+
+
 @locked
 def cmd_charge(args):
     """Charge limit on or off. On: the stop level is saved, the service is
@@ -1267,6 +1498,7 @@ def cmd_charge(args):
     if args.action == "off":
         conf = load_charge_conf()
         conf["enabled"] = False
+        conf["log"] = conf_log(args)
         save_charge_conf(conf)
         run(["systemctl", "disable", "--now", CHARGE_UNIT])
         if charge_supported(bat):
@@ -1281,7 +1513,8 @@ def cmd_charge(args):
     if code != 0:
         emit({"ok": False, "reason": f"{CHARGE_UNIT} is not installed; run install.sh"}, args)
         return 1
-    save_charge_conf({"enabled": True, "stop": args.stop})
+    log = conf_log(args)
+    save_charge_conf({"enabled": True, "stop": args.stop, "log": log})
     code, _, err = run(["systemctl", "enable", "--now", CHARGE_UNIT])
     if code != 0:
         emit({"ok": False, "reason": "could not start the charge service: " +
@@ -1291,6 +1524,98 @@ def cmd_charge(args):
     emit({"ok": error is None, "reason": error, "written": written,
           "limit": load_charge_conf(), "battery": battery_info()}, args)
     return 0 if error is None else 1
+
+
+def charge_log_line(text, err=False):
+    print(text, file=sys.stderr if err else sys.stdout, flush=True)
+
+
+def cmd_charge_sleep(args):
+    """The systemd-sleep hook (`pre`/`post` + the kind of sleep). While the
+    machine sleeps nothing keeps the window, so before a suspend on AC at
+    CHARGE_SLEEP_FLOOR or more, charging is held where it is, and after it the
+    service puts the old mode back. On battery nothing is held: sleep can
+    drain the battery flat, and nothing may be left stopping it from
+    charging then. Hibernate is left alone: the machine is off then."""
+    bat = find_battery()
+    conf = load_charge_conf()
+    if not (conf["enabled"] and charge_supported(bat)):
+        return 0
+    now = time.time()
+    cur = charge_snapshot(bat)
+    if args.when == "pre":
+        if args.kind not in ("suspend", "suspend-then-hibernate"):
+            return 0
+        hold = (cur["ac"] is True and cur["cap"] is not None
+                and cur["cap"] >= CHARGE_SLEEP_FLOOR)
+        os.makedirs(CHARGE_DIR, exist_ok=True)
+        with open(CHARGE_SLEEP_FILE, "w") as fh:
+            json.dump({"t": now, "cap": cur["cap"], "mode": cur["mode"], "ac": cur["ac"],
+                       "held": hold}, fh)
+        if hold and cur["mode"] != CHARGE_INHIBIT:
+            ok, err = write_path(f"{bat}/charge_behaviour", CHARGE_INHIBIT)
+            if not ok:
+                charge_log_line(f"could not hold charging for sleep: {err}", err=True)
+                return 1
+        if conf["log"]:
+            if hold:
+                why = (f"charging held while asleep (charge_behaviour = inhibit-charge), "
+                       f"{cur['mode']} again on wake")
+            elif cur["ac"] is True:
+                why = (f"below {CHARGE_SLEEP_FLOOR} %, so it charges as usual while asleep "
+                       f"(may pass {conf['stop']} %)")
+            else:
+                why = "nothing held: on battery it must stay free to charge"
+            charge_log_line(f"going to sleep at {cur['cap']} %, {battery_state_text(cur)}: {why}")
+            history_append(now, dict(cur, mode=CHARGE_INHIBIT) if hold else cur, "sleep")
+        elif hold:
+            charge_log_line(f"ecomode charge: inhibit-charge for sleep at {cur['cap']} %")
+        return 0
+    before = read_json(CHARGE_SLEEP_FILE)
+    if not isinstance(before, dict) or before.get("woke"):
+        return 0
+    before["woke"] = True
+    with open(CHARGE_SLEEP_FILE, "w") as fh:
+        json.dump(before, fh)
+    if conf["log"]:
+        was = before.get("cap")
+        took = duration_text(now - before["t"]) if isinstance(before.get("t"), (int, float)) else "?"
+        after = (f"the service puts charge_behaviour back to {before.get('mode')} "
+                 f"within {CHARGE_SECS} s" if before.get("held", True)
+                 else "nothing was held")
+        charge_log_line(f"woke up after {took}: battery {was} % -> {cur['cap']} %, "
+                        f"{battery_state_text(cur)}; {after}")
+    return 0
+
+
+def charge_after_sleep(bat):
+    """(woke, sleeping) from the sleep hook's file. On wake the pre-sleep
+    mode goes back - charge_round decides from there - and the file goes."""
+    before = read_json(CHARGE_SLEEP_FILE)
+    if not isinstance(before, dict):
+        return False, False
+    if not before.get("woke"):
+        return False, True
+    mode = before.get("mode")
+    # A file without "held" comes from a hook that always held.
+    if before.get("held", True) and mode in (CHARGE_AUTO, CHARGE_INHIBIT):
+        current, _ = parse_behaviour(read_path(f"{bat}/charge_behaviour"))
+        if current != mode:
+            write_path(f"{bat}/charge_behaviour", mode)
+    with contextlib.suppress(OSError):
+        os.remove(CHARGE_SLEEP_FILE)
+    return True, False
+
+
+def cmd_charge_history(args):
+    """The history for the popup's chart: no root needed, the file is 0644."""
+    now = time.time()
+    conf = load_charge_conf()
+    rows = history_read(now - args.hours * 3600)
+    emit({"now": int(now), "hours": args.hours, "stop": conf["stop"],
+          "resume": conf["stop"] - CHARGE_HYSTERESIS, "log": conf["log"],
+          "enabled": conf["enabled"], "points": rows}, args)
+    return 0
 
 
 def cmd_charge_run(args):
@@ -1308,19 +1633,41 @@ def cmd_charge_run(args):
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
-    last_error = None
+    last_error, watch, last_trim, logging = None, ChargeWatch(), 0.0, None
+    # A fresh start cannot be in the middle of a suspend: a leftover from a
+    # sleep the machine never woke from is stale.
+    with contextlib.suppress(OSError):
+        os.remove(CHARGE_SLEEP_FILE)
     try:
-        while load_charge_conf()["enabled"]:
+        while True:
+            conf = load_charge_conf()
+            bat = find_battery()
+            woke, sleeping = charge_after_sleep(bat) if bat else (False, False)
             written, error = charge_round()
-            if written:
-                print(f"ecomode charge: {written} at "
-                      f"{read_path(f'{find_battery()}/capacity')} %", flush=True)
+            now = time.time()
+            if conf["log"] != logging:
+                if logging is not None:
+                    charge_log_line("battery care log " + ("on" if conf["log"] else "off"))
+                logging, watch = conf["log"], ChargeWatch()
+            if conf["log"] and bat:
+                lines, event = watch.observe(now, charge_snapshot(bat), written, conf,
+                                             slept=woke, sleeping=sleeping)
+                for line in lines:
+                    charge_log_line(line, err=line.startswith("warning"))
+                if event is not None:
+                    history_append(now, watch.prev, event or None)
+                if now - last_trim >= CHARGE_HEARTBEAT:
+                    history_trim(now)
+                    last_trim = now
+            elif written:
+                charge_log_line(f"ecomode charge: {written} at "
+                                f"{read_path(f'{bat}/capacity')} %")
             if error != last_error and error:
-                print(f"ecomode charge: {error}", file=sys.stderr, flush=True)
+                charge_log_line(f"ecomode charge: {error}", err=True)
             last_error = error
+            if not conf["enabled"]:
+                return 0             # charge_round has put it back to auto
             time.sleep(CHARGE_SECS)
-        charge_round()               # disabled: back to auto
-        return 0
     finally:
         bat = find_battery()
         conf = load_charge_conf()
@@ -2024,8 +2371,22 @@ def main():
                            f"resume {CHARGE_HYSTERESIS} below (default 80)")
     p_ch.set_defaults(func=cmd_charge)
 
+    p_ch.add_argument("--log", choices=["on", "off"], default=None,
+                      help="battery care log: every decision to the journal "
+                           "(journalctl -t ecomode-charge) and a 7-day history "
+                           "for the chart; kept as saved when not given")
+
+    p_hi = sub.add_parser("charge-history", help="battery care history for the chart")
+    p_hi.add_argument("--hours", type=int, choices=[24, 168], default=24)
+    p_hi.set_defaults(func=cmd_charge_history)
+
     sub.add_parser("charge-run", help="internal: the charge limit service, "
                    "started by systemd").set_defaults(func=cmd_charge_run)
+
+    p_sl = sub.add_parser("charge-sleep", help="internal: the systemd-sleep hook")
+    p_sl.add_argument("when", choices=["pre", "post"])
+    p_sl.add_argument("kind", nargs="?", default="suspend")
+    p_sl.set_defaults(func=cmd_charge_sleep)
 
     sub.add_parser("gpu-guard", help="internal: keeps the dGPU clock cap, "
                    "started by systemd").set_defaults(func=cmd_gpu_guard)

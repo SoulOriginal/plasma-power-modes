@@ -196,6 +196,43 @@ PlasmoidItem {
         runSequence([Modes.chargeCommand(helper, on, stop)])
     }
 
+    // Battery care log: decisions to the journal and a history for the
+    // chart. Saved by the root helper next to the stop level.
+    function setChargeLog(on) {
+        if (busy) return
+        const bat = status.battery || {}
+        runSequence([Modes.chargeCommand(helper, !!bat.limit, bat.limit_stop || 80, on)])
+    }
+
+    // The chart's history: read only while the popup is open and the log is
+    // on - one small file, no root, once a minute.
+    property var chargeHistory: null
+    property int chargeHours: 24
+    readonly property bool chargeLogOn: !!(status.battery && status.battery.limit
+                                           && status.battery.limit_log)
+
+    function refreshChargeHistory() {
+        if (!chargeLogOn) {
+            chargeHistory = null
+            return
+        }
+        runCmd(Modes.chargeHistoryCommand(helper, chargeHours), function(code, out, err) {
+            if (code !== 0) return
+            try { chargeHistory = JSON.parse(out) } catch (e) {}
+        })
+    }
+
+    onChargeHoursChanged: refreshChargeHistory()
+    onChargeLogOnChanged: refreshChargeHistory()
+
+    Timer {
+        interval: 60000
+        running: root.expanded && root.chargeLogOn
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.refreshChargeHistory()
+    }
+
     function setFollowProfile(on) {
         Plasmoid.configuration.followProfile = on
     }
@@ -408,7 +445,7 @@ PlasmoidItem {
     }
 
     onExpandedChanged: {
-        if (expanded) refresh()   // upgrade to the --deep view immediately
+        if (root.expanded) refresh()   // upgrade to the --deep view immediately
         else actionError = ""     // it has been seen
     }
 

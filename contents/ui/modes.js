@@ -291,10 +291,97 @@ function statusWithMax(st, max) {
 var CHARGE_STOPS = [60, 70, 80, 90]
 
 // The command for the charge limit; any other stop level falls back to 80.
-function chargeCommand(helper, on, stop) {
-    if (!on) return "pkexec " + helper + " --json charge off"
+// `log`: true/false sets the Battery care log, anything else keeps it.
+function chargeCommand(helper, on, stop, log) {
+    var l = log === true ? " --log on" : log === false ? " --log off" : ""
+    if (!on) return "pkexec " + helper + " --json charge off" + l
     var s = CHARGE_STOPS.indexOf(stop) >= 0 ? stop : 80
-    return "pkexec " + helper + " --json charge on --stop " + s
+    return "pkexec " + helper + " --json charge on --stop " + s + l
+}
+
+// No root: the history file is world-readable.
+function chargeHistoryCommand(helper, hours) {
+    return helper + " --json charge-history --hours " + (hours === 168 ? 168 : 24)
+}
+
+// ── Battery care chart ──────────────────────────────────────────────────────
+// History rows are [t, capacity, ac, mode, status, event], one per change.
+// What the line shows at each moment: charging, held/idle on AC, on battery.
+function chargeState(row) {
+    if (row[4] === "Charging") return "charging"
+    if (row[2] === false || row[4] === "Discharging") return "battery"
+    return "held"
+}
+
+var CHARGE_STATE_TEXT = {
+    charging: "charging",
+    held: "on AC, not charging",
+    battery: "on battery"
+}
+
+var CHARGE_EVENT_TEXT = {
+    start: "service started", stop: "charging stopped at the limit",
+    resume: "charging resumed", clear: "hold cleared on battery",
+    plug: "AC plugged in", unplug: "AC unplugged", sleep: "went to sleep",
+    wake: "woke up", outside: "mode changed outside the service", off: "limit switched off"
+}
+
+// The chart, already laid out in time: steps (the charge holds until the
+// next change), sleep bands, and the events worth a marker. A step never
+// runs on into a service start - the machine or the log was off before it,
+// and a flat line through that would claim readings nobody took.
+function chargeSeries(points, now, hours) {
+    var from = now - hours * 3600
+    var rows = (points || []).filter(function(r) {
+        return r && typeof r[0] === "number" && typeof r[1] === "number"
+    })
+    var steps = [], sleeps = [], marks = []
+    var asleepSince = null
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i], next = rows[i + 1]
+        if (r[5] === "sleep") asleepSince = r[0]
+        if (r[5] === "wake" || r[5] === "start") {
+            if (asleepSince !== null) sleeps.push({ t0: asleepSince, t1: r[0] })
+            asleepSince = null
+        }
+        var end = next ? next[0] : now
+        // The service writes a point at least hourly, so before a restart
+        // the last reading is good for an hour at most.
+        if (next && next[5] === "start") end = Math.min(next[0], r[0] + 3600)
+        if (r[5] === "sleep") end = next ? next[0] : now
+        if (end > r[0] && end > from && r[5] !== "sleep")
+            steps.push({ t0: Math.max(r[0], from), t1: end, cap: r[1], state: chargeState(r) })
+        if ((r[5] === "stop" || r[5] === "resume") && r[0] >= from)
+            marks.push({ t: r[0], cap: r[1], event: r[5], state: chargeState(r) })
+    }
+    if (asleepSince !== null) sleeps.push({ t0: asleepSince, t1: now })
+    sleeps = sleeps.filter(function(b) { return b.t1 > from })
+        .map(function(b) { return { t0: Math.max(b.t0, from), t1: b.t1 } })
+    return { from: from, to: now, steps: steps, sleeps: sleeps, marks: marks }
+}
+
+// The reading at time t for the hover line, or null outside the data.
+function chargeAt(points, t) {
+    var rows = points || [], hit = null
+    for (var i = 0; i < rows.length && rows[i][0] <= t; i++) hit = rows[i]
+    return hit
+}
+
+function clockText(t) {
+    var d = new Date(t * 1000)
+    var hh = d.getHours(), mm = d.getMinutes()
+    return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm
+}
+
+// "21:09 · 80 % · on AC, not charging · charging stopped at the limit"
+function chargeHoverText(row, hours) {
+    if (!row) return ""
+    var d = new Date(row[0] * 1000)
+    var when = (hours > 24 ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()] + " " : "")
+        + clockText(row[0])
+    var parts = [when, row[1] + " %", CHARGE_STATE_TEXT[chargeState(row)]]
+    if (row[5] && CHARGE_EVENT_TEXT[row[5]]) parts.push(CHARGE_EVENT_TEXT[row[5]])
+    return parts.join(" · ")
 }
 
 function minutesText(m) {

@@ -197,6 +197,19 @@ def capture(fn, a):
     return _json.loads(buf.getvalue())
 
 
+def capture_text(fn, a):
+    """Run a command, returning what it printed to stdout and stderr."""
+    import io
+    buf = io.StringIO()
+    old, sys.stdout = sys.stdout, buf
+    olderr, sys.stderr = sys.stderr, buf
+    try:
+        fn(a)
+    finally:
+        sys.stdout, sys.stderr = old, olderr
+    return buf.getvalue()
+
+
 def val(knob_id):
     knob = next(k for k in eco.KNOBS if k["id"] == knob_id)
     return eco.read_knob(knob)
@@ -1102,6 +1115,8 @@ def fake_battery(capacity=50, status="Charging", ac="1", behaviour="[auto] inhib
     eco.POWER_SUPPLY_GLOB = str(ps / "*")
     eco.CHARGE_DIR = str(ROOT / "varlib")
     eco.CHARGE_CONF = str(ROOT / "varlib" / "charge.json")
+    eco.CHARGE_HISTORY = str(ROOT / "varlib" / "charge-history")
+    eco.CHARGE_SLEEP_FILE = str(ROOT / "varlib" / "charge-sleep.json")
     return ps / "BAT1"
 
 
@@ -1157,7 +1172,7 @@ res = capture(eco.cmd_charge, argparse.Namespace(json=True, action="on", stop=80
 check("on: saved, service enabled, and at 85 % charging stops at once",
       res["ok"] and res["written"] == "inhibit-charge"
       and RUNS.ran("systemctl", "enable", "--now", "ecomode-charge.service")
-      and eco.load_charge_conf() == {"enabled": True, "stop": 80}, (res, RUNS.calls))
+      and eco.load_charge_conf() == {"enabled": True, "stop": 80, "log": False}, (res, RUNS.calls))
 check("... sysfs now says inhibit-charge",
       eco.parse_behaviour((bat / "charge_behaviour").read_text())[0] == "inhibit-charge")
 (bat / "capacity").write_text("78")
@@ -1200,7 +1215,7 @@ check("no service installed: refused with a pointer to install.sh",
 pathlib.Path(eco.CHARGE_DIR).mkdir(parents=True, exist_ok=True)
 pathlib.Path(eco.CHARGE_CONF).write_text('{"enabled": true, "stop": 7}')
 check("a stop level out of range in the file falls back to 80",
-      eco.load_charge_conf() == {"enabled": True, "stop": 80})
+      eco.load_charge_conf() == {"enabled": True, "stop": 80, "log": False})
 pathlib.Path(eco.CHARGE_CONF).write_text("garbage")
 check("a broken file means off", eco.load_charge_conf()["enabled"] is False)
 
@@ -1212,6 +1227,183 @@ for text, ok in (("80", True), ("50", True), ("95", True), ("49", False), ("96",
     except argparse.ArgumentTypeError:
         good = False
     check(f"charge --stop {text}: {'allowed' if ok else 'refused'}", good is ok)
+
+
+# ── Battery care log: what the journal says, and the chart's history ────────
+print("\n\033[1m22b. battery care log\033[0m")
+CONF = {"enabled": True, "stop": 80, "log": True}
+
+
+def snap(cap, ac=True, mode="auto", status="Charging", power_w=30.0):
+    return {"cap": cap, "ac": ac, "mode": mode, "status": status, "power_w": power_w}
+
+
+w = eco.ChargeWatch()
+lines, ev = w.observe(1000, snap(61), None, CONF)
+check("first reading: says the limit and the battery",
+      ev == "start" and lines == ["watching: limit 80 %, resume at 75 %; "
+                                  "battery 61 %, charging at 30.0 W, on AC"], lines)
+lines, ev = w.observe(1030, snap(62), None, CONF)
+check("a 1 % step inside the same 5 %: no line, but a chart point", lines == [] and ev == "", (lines, ev))
+lines, ev = w.observe(1060, snap(65), None, CONF)
+check("crossing 65 %: one step line", lines == ["battery 65 %, charging at 30.0 W, on AC"], lines)
+lines, ev = w.observe(1090, snap(80, mode="inhibit-charge"), "inhibit-charge", CONF)
+check("the stop: says why and where it resumes", ev == "stop" and lines == [
+      "charging stopped at 80 %: reached the 80 % limit (charge_behaviour = inhibit-charge); "
+      "resumes at 75 %"], lines)
+lines, ev = w.observe(1095, snap(80, mode="inhibit-charge", status="Not charging", power_w=None),
+                      None, CONF)
+check("the firmware following is confirmed, with the delay",
+      lines == ["firmware followed: battery not charging after 5 s"], lines)
+lines, ev = w.observe(1095 + 1800, snap(80, mode="inhibit-charge", status="Not charging",
+                                        power_w=None), None, CONF)
+check("held half an hour: nothing logged, nothing new for the chart", lines == [] and ev is None,
+      (lines, ev))
+lines, ev = w.observe(1095 + 3600, snap(80, mode="inhibit-charge", status="Not charging",
+                                        power_w=None), None, CONF)
+check("held an hour: one heartbeat, and a chart point with it",
+      lines == ["no change for 1 h 00 min: battery 80 %, held, not charging, on AC"]
+      and ev == "", (lines, ev))
+lines, ev = w.observe(5000, snap(79, ac=False, mode="auto", status="Discharging", power_w=12.0),
+                      "auto", CONF)
+check("unplugged: the cause first, then what was done",
+      ev == "unplug" and lines == ["AC unplugged at 79 %: running on battery",
+                                   "charge hold cleared at 79 %: not needed on battery "
+                                   "(charge_behaviour = auto)"], lines)
+lines, ev = w.observe(5030, snap(79, ac=False, mode="inhibit-charge", status="Discharging"),
+                      None, CONF)
+check("a mode change nobody here made: warned",
+      ev == "outside" and lines[0].startswith("warning: charge_behaviour changed outside"), lines)
+
+w = eco.ChargeWatch()
+w.observe(0, snap(70), None, CONF)
+w.observe(30, snap(75, mode="auto", status="Not charging"), "auto", CONF)
+lines, _ = w.observe(30 + eco.CHARGE_CONFIRM_SECS, snap(75, mode="auto", status="Not charging"),
+                     None, CONF)
+check("the firmware not following a write: one warning after the wait",
+      len(lines) == 1 and lines[0].startswith("warning: charge_behaviour is auto but the battery "
+                                              "still reports Not charging"), lines)
+lines, _ = w.observe(30 + 2 * eco.CHARGE_CONFIRM_SECS, snap(75, mode="auto", status="Not charging"),
+                     None, CONF)
+check("... and only once", not any(x.startswith("warning") for x in lines), lines)
+
+w = eco.ChargeWatch()
+w.observe(0, snap(67), None, CONF)
+lines, ev = w.observe(10, snap(67, mode="inhibit-charge"), None, CONF, sleeping=True)
+check("the sleep hook's hold is not taken for an outside change", lines == [], lines)
+lines, ev = w.observe(4000, snap(66, mode="auto"), None, CONF, slept=True)
+check("after a wake: a chart point, no lines of its own", ev == "wake" and lines == [], (lines, ev))
+
+check("durations read like a person wrote them",
+      (eco.duration_text(42), eco.duration_text(600), eco.duration_text(4320))
+      == ("42 s", "10 min", "1 h 12 min"))
+
+fake_sysfs(BASE)
+bat = fake_battery(capacity=67)
+eco.history_append(100, snap(67), "plug")
+eco.history_append(200, snap(68, ac=None, mode=None, status="Weird"))
+with open(eco.CHARGE_HISTORY, "a") as fh:
+    fh.write("garbage line\n")
+check("history: about 25 bytes a line", len(pathlib.Path(eco.CHARGE_HISTORY).read_text()
+                                           .splitlines()[0]) <= 30)
+rows = eco.history_read(0)
+check("history reads back, damaged lines skipped",
+      rows == [[100, 67, True, "auto", "Charging", "plug"],
+               [200, 68, None, None, "Unknown", None]], rows)
+check("history: only the asked window", eco.history_read(150) == rows[1:])
+eco.history_trim(150 + 7 * 86400, days=7)
+check("trim drops what is older than the window",
+      [r[0] for r in eco.history_read(0)] == [200], eco.history_read(0))
+
+# The sleep hook: holds charging before suspend, the service restores it.
+eco.save_charge_conf({"enabled": True, "stop": 80, "log": True})
+(ROOT / "ps" / "ACAD" / "online").write_text("1")
+out = capture_text(eco.cmd_charge_sleep, argparse.Namespace(when="pre", kind="suspend"))
+check("pre-suspend at 67 % on AC: charging held",
+      eco.parse_behaviour((bat / "charge_behaviour").read_text())[0] == "inhibit-charge"
+      and "going to sleep at 67 %" in out, out)
+check("... and the history marks the sleep", eco.history_read(0)[-1][5] == "sleep")
+check("the service sees a suspend under way, not a wake",
+      eco.charge_after_sleep(bat) == (False, True))
+(bat / "capacity").write_text("66")
+out = capture_text(eco.cmd_charge_sleep, argparse.Namespace(when="post", kind="suspend"))
+check("post: says how long and what it was", "woke up after" in out and "67 % -> 66 %" in out, out)
+check("the service then puts auto back and drops the file",
+      eco.charge_after_sleep(bat) == (True, False)
+      and eco.parse_behaviour((bat / "charge_behaviour").read_text())[0] == "auto"
+      and not os.path.exists(eco.CHARGE_SLEEP_FILE))
+out = capture_text(eco.cmd_charge_sleep, argparse.Namespace(when="pre", kind="hibernate"))
+check("hibernate is left alone",
+      eco.parse_behaviour((bat / "charge_behaviour").read_text())[0] == "auto"
+      and not os.path.exists(eco.CHARGE_SLEEP_FILE), out)
+def mode_now():
+    return eco.parse_behaviour((bat / "charge_behaviour").read_text())[0]
+
+
+PRE = argparse.Namespace(when="pre", kind="suspend")
+POST = argparse.Namespace(when="post", kind="suspend")
+
+(bat / "capacity").write_text("30")
+out = capture_text(eco.cmd_charge_sleep, PRE)
+check("pre-suspend at 30 % on AC: not held, it charges while asleep",
+      mode_now() == "auto" and "below 50 %" in out
+      and eco.read_json(eco.CHARGE_SLEEP_FILE)["held"] is False, out)
+(bat / "capacity").write_text("55")
+out = capture_text(eco.cmd_charge_sleep, POST)
+check("... the wake is still logged, with nothing to put back", "nothing was held" in out, out)
+check("... and the service restores nothing, but the sleep ends for the chart",
+      eco.charge_after_sleep(bat) == (True, False) and mode_now() == "auto"
+      and not os.path.exists(eco.CHARGE_SLEEP_FILE))
+
+(bat / "capacity").write_text("49")
+capture_text(eco.cmd_charge_sleep, PRE)
+check("at 49 %: still below the floor", mode_now() == "auto")
+capture_text(eco.cmd_charge_sleep, POST)
+eco.charge_after_sleep(bat)
+(bat / "capacity").write_text("50")
+capture_text(eco.cmd_charge_sleep, PRE)
+check("at 50 % on AC: held", mode_now() == "inhibit-charge")
+capture_text(eco.cmd_charge_sleep, POST)
+eco.charge_after_sleep(bat)
+check("... and auto again after the wake", mode_now() == "auto")
+
+(ROOT / "ps" / "ACAD" / "online").write_text("0")
+(bat / "capacity").write_text("90")
+out = capture_text(eco.cmd_charge_sleep, PRE)
+check("pre-suspend on battery, even at 90 %: nothing held",
+      mode_now() == "auto" and "nothing held" in out, out)
+capture_text(eco.cmd_charge_sleep, POST)
+eco.charge_after_sleep(bat)
+(ROOT / "ps" / "ACAD" / "online").write_text("1")
+
+pathlib.Path(eco.CHARGE_SLEEP_FILE).write_text(
+    '{"t": 0, "cap": 80, "mode": "inhibit-charge", "ac": true, "woke": true}')
+check("a file from the old hook (no 'held') still gets its mode back",
+      eco.charge_after_sleep(bat) == (True, False) and mode_now() == "inhibit-charge")
+eco.write_path(str(bat / "charge_behaviour"), "auto")
+
+eco.save_charge_conf({"enabled": True, "stop": 80, "log": False})
+(bat / "capacity").write_text("30")
+out = capture_text(eco.cmd_charge_sleep, PRE)
+check("log off and nothing held: the hook says nothing", out == "", out)
+capture_text(eco.cmd_charge_sleep, POST)
+eco.charge_after_sleep(bat)
+
+eco.save_charge_conf({"enabled": False, "stop": 80, "log": True})
+capture_text(eco.cmd_charge_sleep, argparse.Namespace(when="pre", kind="suspend"))
+check("Battery care off: the hook does nothing",
+      eco.parse_behaviour((bat / "charge_behaviour").read_text())[0] == "auto")
+
+RUNS.replies[("systemctl", "cat")] = (0, "[Unit]", "")
+eco.save_charge_conf({"enabled": True, "stop": 70, "log": True})
+capture(eco.cmd_charge, argparse.Namespace(json=True, action="on", stop=80, log=None))
+check("--log not given: the saved choice stays", eco.load_charge_conf()["log"] is True)
+capture(eco.cmd_charge, argparse.Namespace(json=True, action="on", stop=80, log="off"))
+check("--log off", eco.load_charge_conf() == {"enabled": True, "stop": 80, "log": False})
+res = capture(eco.cmd_charge_history, argparse.Namespace(json=True, hours=24))
+check("charge-history: the window and the levels for the chart",
+      res["stop"] == 80 and res["resume"] == 75 and res["hours"] == 24
+      and isinstance(res["points"], list), res)
 
 # The service on stop: the limit holds above the stop level, never below it.
 def run_service_once(capacity, enabled=True, stop=80):

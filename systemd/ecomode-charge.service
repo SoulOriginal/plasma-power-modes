@@ -8,12 +8,16 @@ Type=simple
 ExecStart=/usr/local/bin/ecomode charge-run
 Restart=on-failure
 RestartSec=30
-# Reads its setting and the battery, writes charge_behaviour. Nothing else.
+# One name for the service and its sleep hook: journalctl -t ecomode-charge
+SyslogIdentifier=ecomode-charge
+# Reads its setting and the battery, writes charge_behaviour, and - with the
+# Battery care log on - its history in /var/lib/ecomode. Nothing else.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateNetwork=yes
+ReadWritePaths=-/var/lib/ecomode
 
 [Install]
 WantedBy=multi-user.target
