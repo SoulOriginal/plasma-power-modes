@@ -50,6 +50,10 @@
       <label>Follow the KDE power profile: power-saver = Eco, balanced = Normal, performance = Max</label>
       <default>false</default>
     </entry>
+    <entry name="syncProfile" type="Bool">
+      <label>With followProfile: a mode picked in the widget also sets the KDE power profile (two-way)</label>
+      <default>false</default>
+    </entry>
     <entry name="gpuBoost" type="Bool">
       <label>Run NVIDIA Dynamic Boost (nvidia-powerd) while Max is on</label>
       <default>true</default>

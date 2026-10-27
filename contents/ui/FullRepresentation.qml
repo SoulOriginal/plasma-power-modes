@@ -390,6 +390,13 @@ Item {
                     onToggled: function(want) { root.setFollowProfile(want) }
                 }
                 Toggle {
+                    visible: root.followProfile
+                    text: "Set the KDE profile too"
+                    hint: "Two-way: Eco here moves the slider to Power Save, Normal to Balanced"
+                    on: root.syncProfile
+                    onToggled: function(want) { root.setSyncProfile(want) }
+                }
+                Toggle {
                     text: "Show watts in panel"
                     hint: "Runs a small root sampler; also shows what limits the CPU"
                     on: root.showWatts

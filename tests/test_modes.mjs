@@ -367,4 +367,24 @@ t("health trend: a recalibration upwards shows as such", () =>
     assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 67.4, 83]]),
                  "+1 % of design since Oct 26"))
 
+// ── Two-way sync with the KDE slider ────────────────────────────────────────
+t("sync: Eco moves the slider to Power Save", () =>
+    assert.equal(m.profileCommand("eco", "balanced", true), "powerprofilesctl set power-saver"))
+t("sync: Normal moves it to Balanced", () =>
+    assert.equal(m.profileCommand("normal", "performance", true), "powerprofilesctl set balanced"))
+t("sync: already there, nothing to do", () =>
+    assert.equal(m.profileCommand("eco", "power-saver", true), null))
+t("sync: Max sets nothing, its hold does", () =>
+    assert.equal(m.profileCommand("max", "balanced", true), null))
+t("sync off: the slider is never touched", () =>
+    assert.equal(m.profileCommand("eco", "balanced", false), null))
+t("sync: a mode name from outside never reaches the shell", () =>
+    assert.equal(m.profileCommand("eco; reboot", "balanced", true), null))
+t("sync: a slider moved by the widget is followed back to the same mode", () => {
+    // Our own profile write comes back through the follow path; it must not
+    // pick a different mode than the one just chosen.
+    assert.equal(m.followTarget("balanced", { mode: "normal" }), null)
+    assert.equal(m.followTarget("power-saver", { mode: "eco" }), "eco")   // re-check only
+})
+
 console.log(`\n${passed} passed`)

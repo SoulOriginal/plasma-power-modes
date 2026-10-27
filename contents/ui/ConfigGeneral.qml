@@ -23,6 +23,7 @@ Kirigami.FormLayout {
     property alias cfg_wattsSeconds: wattsSpin.value
     property alias cfg_wattsGpu: wattsGpuBox.checked
     property alias cfg_followProfile: followBox.checked
+    property alias cfg_syncProfile: syncBox.checked
     property alias cfg_gpuBoost: gpuBoostBox.checked
 
     // The fan mode the widget runs with, as main.qml works it out.
@@ -85,10 +86,24 @@ Kirigami.FormLayout {
         opacity: 0.7
         font: Kirigami.Theme.smallFont
         text: "Power Save turns Eco on, Balanced goes back to Normal, " +
-              "Performance starts Max. Only this way round: picking a mode " +
-              "here never moves the slider, and the next slider move takes " +
-              "over again. The widget reacts to the daemon's change signal, " +
-              "so this costs nothing while the profile stays put."
+              "Performance starts Max. The widget reacts to the daemon's " +
+              "change signal, so this costs nothing while the profile stays put."
+    }
+
+    CheckBox {
+        id: syncBox
+        enabled: followBox.checked
+        text: "Set the slider from the widget too (two-way)"
+    }
+
+    Label {
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+        wrapMode: Text.WordWrap
+        opacity: 0.7
+        font: Kirigami.Theme.smallFont
+        text: "Picking Eco here moves the slider to Power Save, Normal to " +
+              "Balanced. Max needs nothing: it holds Performance itself, and " +
+              "when it ends the slider is where Normal or Eco put it."
     }
 
     Item { Kirigami.FormData.isSection: true }

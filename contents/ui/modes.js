@@ -65,6 +65,19 @@ function ecoDrifted(st) {
 // after the change settled.
 var PROFILE_MODES = { "power-saver": "eco", "balanced": "normal", "performance": "max" }
 
+// Two-way sync, the other direction: the KDE profile a mode picked in the
+// widget puts the slider on. Max needs none - its own hold sets performance,
+// and the profile underneath (what Max returns to) stays the user's.
+var MODE_PROFILES = { eco: "power-saver", normal: "balanced" }
+
+// The command that moves the KDE slider for a mode, or null: sync off, the
+// slider already there, or nothing to set. powerprofilesctl needs no root.
+function profileCommand(target, current, sync) {
+    var p = MODE_PROFILES[target]
+    if (!sync || !p || p === current) return null
+    return "powerprofilesctl set " + p
+}
+
 function followTarget(profile, st) {
     var target = PROFILE_MODES[profile]
     if (!target || !st) return null

@@ -43,6 +43,8 @@ PlasmoidItem {
     readonly property int wattsSeconds: Plasmoid.configuration.wattsSeconds || 3
     readonly property bool wattsGpu: Plasmoid.configuration.wattsGpu !== false
     readonly property bool followProfile: Plasmoid.configuration.followProfile === true
+    // Two-way: with following on, a mode picked here also moves the KDE slider.
+    readonly property bool syncProfile: followProfile && Plasmoid.configuration.syncProfile === true
     readonly property bool gpuBoost: Plasmoid.configuration.gpuBoost !== false
     // Last record from the sampler, {cpu_w, battery_w, cpu_limit, gpu, at,
     // interval}, or null.
@@ -151,11 +153,24 @@ PlasmoidItem {
     function setMode(target, force) {
         if (busy) return
         if (target === "eco" || target === "max") Plasmoid.configuration.lastMode = target
-        runSequence(Modes.commandsFor(mode, target, {
+        const cmds = Modes.commandsFor(mode, target, {
             helper: helper, maxHelper: maxHelper, level: level,
             maxPct: maxPct, fans: fansMode, gpuBoost: gpuBoost, status: status,
             force: force === true
-        }))
+        })
+        // Two-way sync: the slider first. A profile write makes the firmware
+        // reset the CPU limits, so Eco has to come after it, not before. The
+        // mode change goes ahead even if the daemon is not there.
+        const profile = Modes.profileCommand(target, kdeProfile, syncProfile)
+        if (profile === null) {
+            runSequence(cmds)
+            return
+        }
+        busy = true
+        runCmd(profile, function() {
+            busy = false
+            runSequence(cmds)
+        })
     }
 
     // Middle click on the panel.
@@ -235,6 +250,10 @@ PlasmoidItem {
 
     function setFollowProfile(on) {
         Plasmoid.configuration.followProfile = on
+    }
+
+    function setSyncProfile(on) {
+        Plasmoid.configuration.syncProfile = on
     }
 
     // ── Following the KDE power profile ──────────────────────────────────────
