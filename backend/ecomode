@@ -1209,6 +1209,48 @@ def gpu_query():
     return parse_gpu_csv(out.strip().split("\n")[0])
 
 
+def parse_nvsmi_processes(text):
+    """(pid, process path, type) rows from the Processes table of plain
+    `nvidia-smi`: the driver's own list of who has a context on the card."""
+    rows, inside = [], False
+    for line in (text or "").splitlines():
+        if "Processes:" in line:
+            inside = True
+            continue
+        if not inside:
+            continue
+        parts = line.strip("| \t").split()
+        # GPU GI CI PID Type name... memory
+        if len(parts) < 7 or not parts[3].isdigit() or parts[4] not in ("C", "G", "C+G"):
+            continue
+        rows.append((int(parts[3]), " ".join(parts[5:-1]), parts[4]))
+    return rows
+
+
+def gpu_processes():
+    """Who the driver says has a context on the dGPU. As a user /proc hides
+    root's processes and KWin's (it holds a capability, so its fds are
+    unreadable); the driver lists them all. It talks to the driver, so like
+    gpu_query() it is asked only while the card is awake anyway."""
+    code, out, _ = nvsmi(timeout=5)
+    return parse_nvsmi_processes(out) if code == 0 else None
+
+
+def merge_driver_holders(holders, procs, driving):
+    """The /proc holders plus the processes only the driver could name."""
+    seen = {h["name"] for h in holders} | {h["pid"] for h in holders}
+    out = list(holders)
+    for pid, path, _ in procs or ():
+        name = os.path.basename(path) or path
+        if name in seen or pid in seen:
+            continue
+        awake = holder_keeps_awake(name, {"/dev/nvidia0"}, driving)
+        out.append({"pid": pid, "name": name, "count": 1, "awake": awake,
+                    "follower": False, "note": holder_note(pid, name, awake)})
+        seen |= {name, pid}
+    return sorted(out, key=lambda h: (not h["awake"], h["name"].lower()))
+
+
 def gpu_runtime():
     """Runtime PM state from sysfs; reading it never wakes the GPU."""
     def ms(name):
@@ -1386,8 +1428,14 @@ def dgpu_info(deep=False):
     if not info["present"] or not deep:
         return info
     info["holders"] = gpu_holders()
+    info["holders_complete"] = False
     info["powerd"] = service_active("nvidia-powerd")
     if info["runtime_status"] == "active":
+        procs = gpu_processes()
+        if procs is not None:
+            info["holders"] = merge_driver_holders(info["holders"], procs,
+                                                   bool(info["displays"]))
+            info["holders_complete"] = True
         info["gpu"] = gpu_query()
         if info["gpu"]:
             info["power_w"] = info["gpu"].get("power_w")

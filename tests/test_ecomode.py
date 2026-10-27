@@ -1246,6 +1246,35 @@ check("the note says why the desktop is listed",
       "lets it sleep" in eco.holder_note(1, "kwin_wayland", False)
       and "drives a display" in eco.holder_note(1, "kwin_wayland", True))
 
+NVSMI = """+-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            1095      G   /usr/lib/Xorg                             4MiB |
+|    0   N/A  N/A            1350    C+G   /usr/bin/kwin_wayland                     7MiB |
+|    0   N/A  N/A            4321      C   /opt/my app/bin/render job               812MiB |
++-----------------------------------------------------------------------------------------+
+"""
+procs = eco.parse_nvsmi_processes(NVSMI)
+check("driver list: pid, path (spaces kept) and type",
+      procs == [(1095, "/usr/lib/Xorg", "G"), (1350, "/usr/bin/kwin_wayland", "C+G"),
+                (4321, "/opt/my app/bin/render job", "C")], procs)
+check("driver list: nothing parsed from junk", eco.parse_nvsmi_processes("no gpu\n") == []
+      and eco.parse_nvsmi_processes(None) == [])
+mine = [{"pid": 77, "name": "blender", "count": 1, "awake": True, "follower": False, "note": None}]
+merged = eco.merge_driver_holders(mine, procs, False)
+names = [(h["name"], h["awake"]) for h in merged]
+check("merged: the hidden desktop is listed, not keeping it awake; a real job is",
+      names == [("blender", True), ("render job", True), ("kwin_wayland", False),
+                ("Xorg", False)], names)
+check("merged: a process seen in /proc is not listed twice",
+      len(eco.merge_driver_holders(
+          [{"pid": 1350, "name": "kwin_wayland", "count": 1, "awake": False,
+            "follower": False, "note": None}], procs, False)) == 3)
+check("merged: with a display on the dGPU the desktop does keep it awake",
+      all(h["awake"] for h in eco.merge_driver_holders([], procs, True)))
+
 # ── Battery care log: what the journal says, and the chart's history ────────
 print("\n\033[1m22b. battery care log\033[0m")
 CONF = {"enabled": True, "stop": 80, "log": True}

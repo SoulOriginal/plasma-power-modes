@@ -612,8 +612,10 @@ Item {
                     wrapMode: Text.WordWrap
                     opacity: 0.6
                     font: Kirigami.Theme.smallFont
-                    text: "No process of yours holds it; it should power down shortly "
-                          + "(system processes are not visible here)."
+                    text: full.dgpu.holders_complete
+                          ? "Nothing keeps it awake; it should power down in a few seconds."
+                          : "No process of yours holds it; it should power down shortly "
+                            + "(system processes are not visible here)."
                 }
             }
 
