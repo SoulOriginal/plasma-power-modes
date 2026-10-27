@@ -1211,7 +1211,9 @@ def gpu_query():
 
 def parse_nvsmi_processes(text):
     """(pid, process path, type) rows from the Processes table of plain
-    `nvidia-smi`: the driver's own list of who has a context on the card."""
+    `nvidia-smi`: the driver's own list of who has a context on the card.
+    None when there is no such table or a row in it does not read as one:
+    then the list is not known to be whole."""
     rows, inside = [], False
     for line in (text or "").splitlines():
         if "Processes:" in line:
@@ -1220,11 +1222,14 @@ def parse_nvsmi_processes(text):
         if not inside:
             continue
         parts = line.strip("| \t").split()
-        # GPU GI CI PID Type name... memory
-        if len(parts) < 7 or not parts[3].isdigit() or parts[4] not in ("C", "G", "C+G"):
+        # GPU GI CI PID Type name... memory; rules, headers and "No running
+        # processes found" are not rows.
+        if not parts or not parts[0].isdigit():
             continue
+        if len(parts) < 7 or not parts[3].isdigit() or parts[4] not in ("C", "G", "C+G"):
+            return None                   # a layout this does not know
         rows.append((int(parts[3]), " ".join(parts[5:-1]), parts[4]))
-    return rows
+    return rows if inside else None
 
 
 def gpu_processes():
@@ -1246,7 +1251,8 @@ def merge_driver_holders(holders, procs, driving):
             continue
         awake = holder_keeps_awake(name, {"/dev/nvidia0"}, driving)
         out.append({"pid": pid, "name": name, "count": 1, "awake": awake,
-                    "follower": False, "note": holder_note(pid, name, awake)})
+                    "follower": is_sensor_follower(pid, name),
+                    "note": holder_note(pid, name, awake)})
         seen |= {name, pid}
     return sorted(out, key=lambda h: (not h["awake"], h["name"].lower()))
 
@@ -1750,6 +1756,23 @@ def charge_after_sleep(bat):
     return True, False
 
 
+def cmd_set_profile(args):
+    """Moves the KDE power profile slider: power-profiles-daemon's active
+    profile. For the widget's two-way sync, as one step of its command
+    sequence, so a failure is reported like any other. Needs no root."""
+    if not shutil.which("powerprofilesctl"):
+        emit({"ok": False, "reason": "powerprofilesctl not found "
+              "(power-profiles-daemon is needed for two-way sync)"}, args)
+        return 1
+    code, _, err = run(["powerprofilesctl", "set", args.profile], timeout=10)
+    if code != 0:
+        emit({"ok": False, "reason": f"could not set the KDE profile to {args.profile}: "
+              + (err.strip() or f"exit {code}")}, args)
+        return 1
+    emit({"ok": True, "profile": args.profile}, args)
+    return 0
+
+
 def cmd_charge_history(args):
     """The history for the popup's chart: no root needed, the file is 0644."""
     now = time.time()
@@ -1758,7 +1781,10 @@ def cmd_charge_history(args):
     emit({"now": int(now), "hours": args.hours, "stop": conf["stop"],
           "resume": conf["stop"] - CHARGE_HYSTERESIS, "log": conf["log"],
           "enabled": conf["enabled"], "points": rows,
-          "health": health_read(now - CHARGE_HEALTH_DAYS * 86400)}, args)
+          "health": health_read(now - CHARGE_HEALTH_DAYS * 86400),
+          # Sleep figures use the whole week, not the chart's window.
+          "sleeps": [r for r in history_read(now - CHARGE_HISTORY_DAYS * 86400)
+                     if r[5] in ("sleep", "wake", "start")]}, args)
     return 0
 
 
@@ -2524,6 +2550,10 @@ def main():
                       help="battery care log: every decision to the journal "
                            "(journalctl -t ecomode-charge) and a 7-day history "
                            "for the chart; kept as saved when not given")
+
+    p_sp = sub.add_parser("set-profile", help="set the KDE power profile (no root)")
+    p_sp.add_argument("profile", choices=["power-saver", "balanced", "performance"])
+    p_sp.set_defaults(func=cmd_set_profile)
 
     p_hi = sub.add_parser("charge-history", help="battery care history for the chart")
     p_hi.add_argument("--hours", type=int, choices=[24, 168], default=24)

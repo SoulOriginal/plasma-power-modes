@@ -70,12 +70,24 @@ var PROFILE_MODES = { "power-saver": "eco", "balanced": "normal", "performance":
 // and the profile underneath (what Max returns to) stays the user's.
 var MODE_PROFILES = { eco: "power-saver", normal: "balanced" }
 
-// The command that moves the KDE slider for a mode, or null: sync off, the
-// slider already there, or nothing to set. powerprofilesctl needs no root.
-function profileCommand(target, current, sync) {
+// The step that moves the KDE slider for a mode, or null: sync off, the
+// slider already there, or nothing to set. No root; it answers in JSON
+// like every step of a sequence, so a failure shows like any other.
+function profileCommand(helper, target, current, sync) {
     var p = MODE_PROFILES[target]
     if (!sync || !p || p === current) return null
-    return "powerprofilesctl set " + p
+    return helper + " --json set-profile " + p
+}
+
+// Where the slider step goes in a mode change. A manual profile set makes
+// power-profiles-daemon drop every hold, Max's too - so leaving Max it comes
+// after "max off", or Max would end as if the user had moved the slider.
+// It always comes before "eco on": a profile write makes the firmware reset
+// the CPU limits Eco has just set.
+function withProfile(cmds, profileCmd, from) {
+    if (!profileCmd) return cmds
+    if (from === "max") return cmds.slice(0, 1).concat([profileCmd], cmds.slice(1))
+    return [profileCmd].concat(cmds)
 }
 
 function followTarget(profile, st) {
@@ -271,7 +283,11 @@ function fanHoldText(st, nowSec) {
     var left = typeof armed === "number" ? Math.ceil(armed - nowSec) : -1
     if (left > 0)
         return "Left at full speed after Max: back to auto in about " + left + " s"
-    return "Left at full speed after Max: back to auto about 2 min after the last Max change"
+    // No time to give: say only what is known.
+    if (m || st.max_last)
+        return "Full speed, held by the laptop: it usually goes back to auto "
+            + "about 2 min after the last Max change"
+    return "Full speed, not set by this widget"
 }
 
 // Collapsed with Max on, the widget reads the keeper's own max.json with
@@ -389,7 +405,7 @@ function chargeSeries(points, now, hours) {
 }
 
 // Sleeps from the history: pairs of a "sleep" row and the "wake" after it,
-// as { t, secs, from, to, ac } (ac: on AC when it went to sleep).
+// as { t, secs, from, to, ac, acEnd } (on AC when it went to sleep / woke).
 function chargeSleeps(points) {
     var rows = points || [], out = [], start = null
     for (var i = 0; i < rows.length; i++) {
@@ -398,7 +414,7 @@ function chargeSleeps(points) {
         else if (r[5] === "start") start = null      // never woke: no pair
         else if (r[5] === "wake" && start) {
             out.push({ t: start[0], secs: r[0] - start[0], from: start[1], to: r[1],
-                       ac: start[2] === true })
+                       ac: start[2] === true, acEnd: r[2] === true })
             start = null
         }
     }
@@ -416,6 +432,10 @@ function lastSleepText(points) {
     var sl = chargeSleeps(points)
     if (!sl.length) return ""
     var s = sl[sl.length - 1]
+    // Plugged in or unplugged while asleep: levels only, no drain to give.
+    if (s.ac !== s.acEnd)
+        return sleepDuration(s.secs) + (s.ac ? " on AC, then battery, " : " on battery, then AC, ")
+            + s.from + " % \u2192 " + s.to + " %"
     var text = sleepDuration(s.secs) + (s.ac ? " on AC, " : " on battery, ")
     if (s.ac) return text + s.from + " % \u2192 " + s.to + " %"
     var lost = s.from - s.to
@@ -429,7 +449,7 @@ function lastSleepText(points) {
 function sleepDrainText(points) {
     var secs = 0, lost = 0, n = 0
     chargeSleeps(points).forEach(function(s) {
-        if (s.ac) return
+        if (s.ac || s.acEnd) return       // only sleeps on battery all through
         secs += s.secs; lost += s.from - s.to; n++
     })
     if (secs < 3600) return ""

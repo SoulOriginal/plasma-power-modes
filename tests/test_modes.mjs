@@ -369,17 +369,29 @@ t("health trend: a recalibration upwards shows as such", () =>
 
 // ── Two-way sync with the KDE slider ────────────────────────────────────────
 t("sync: Eco moves the slider to Power Save", () =>
-    assert.equal(m.profileCommand("eco", "balanced", true), "powerprofilesctl set power-saver"))
+    assert.equal(m.profileCommand("/h", "eco", "balanced", true), "/h --json set-profile power-saver"))
 t("sync: Normal moves it to Balanced", () =>
-    assert.equal(m.profileCommand("normal", "performance", true), "powerprofilesctl set balanced"))
+    assert.equal(m.profileCommand("/h", "normal", "performance", true), "/h --json set-profile balanced"))
 t("sync: already there, nothing to do", () =>
-    assert.equal(m.profileCommand("eco", "power-saver", true), null))
+    assert.equal(m.profileCommand("/h", "eco", "power-saver", true), null))
 t("sync: Max sets nothing, its hold does", () =>
-    assert.equal(m.profileCommand("max", "balanced", true), null))
+    assert.equal(m.profileCommand("/h", "max", "balanced", true), null))
 t("sync off: the slider is never touched", () =>
-    assert.equal(m.profileCommand("eco", "balanced", false), null))
+    assert.equal(m.profileCommand("/h", "eco", "balanced", false), null))
 t("sync: a mode name from outside never reaches the shell", () =>
-    assert.equal(m.profileCommand("eco; reboot", "balanced", true), null))
+    assert.equal(m.profileCommand("/h", "eco; reboot", "balanced", true), null))
+t("sync: leaving Max, the slider moves after max off, before eco on", () => {
+    // A manual set drops Max's hold; before "max off" Max would end as if
+    // the user had moved the slider.
+    const p = "/h --json set-profile power-saver"
+    assert.deepEqual(m.withProfile(["MAXOFF", "ECOON"], p, "max"), ["MAXOFF", p, "ECOON"])
+    assert.deepEqual(m.withProfile(["MAXOFF"], "/h --json set-profile balanced", "max"),
+                     ["MAXOFF", "/h --json set-profile balanced"])
+})
+t("sync: from Normal, the slider before eco on", () =>
+    assert.deepEqual(m.withProfile(["ECOON"], "P", "normal"), ["P", "ECOON"]))
+t("sync: nothing to set, the sequence as it was", () =>
+    assert.deepEqual(m.withProfile(["ECOON"], null, "normal"), ["ECOON"]))
 t("sync: a slider moved by the widget is followed back to the same mode", () => {
     // Our own profile write comes back through the follow path; it must not
     // pick a different mode than the one just chosen.
@@ -400,9 +412,12 @@ t("fans: a running auto session that is settling gives its own time", () =>
     assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" },
                                  max: { fans_state: "auto", fans_armed_until: 1030 } }, 1000),
                  "Left at full speed after Max: back to auto in about 30 s"))
-t("fans: no record, or it ran out - say what the rule is", () =>
+t("fans: no time left in the record - only what is known", () =>
     assert.match(m.fanHoldText({ fans: { pwm_enable: "0" }, max_last: { fans_armed_until: 900 } }, 1000),
-                 /about 2 min after the last Max change$/))
+                 /usually goes back to auto about 2 min after the last Max change$/))
+t("fans: no Max ever ran - not blamed on Max", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" }, max: null, max_last: null }, 1000),
+                 "Full speed, not set by this widget"))
 
 // ── Battery use while asleep ────────────────────────────────────────────────
 const SL = [
@@ -416,6 +431,13 @@ const SL = [
 t("sleeps: pairs, a sleep with no wake is dropped", () =>
     assert.deepEqual(m.chargeSleeps(SL).map(s => [s.secs, s.from, s.to, s.ac]),
                      [[31500, 80, 80, true], [2400, 74, 73, false]]))
+const PLUGGED = [[0, 50, false, "a", "D", "sleep"], [7200, 80, true, "a", "C", "wake"]]
+t("sleeps: plugged in while asleep - levels only, no rate", () =>
+    assert.equal(m.lastSleepText(PLUGGED), "2 h 00 min on battery, then AC, 50 % → 80 %"))
+t("drain: a sleep that ended on AC is not counted as drain", () =>
+    assert.equal(m.sleepDrainText(PLUGGED.concat([
+        [10000, 80, false, "a", "D", "sleep"], [13600, 79, false, "a", "D", "wake"]])),
+        "1 %/h over 1 sleep on battery"))
 t("last sleep: on battery, with its rate", () =>
     assert.equal(m.lastSleepText(SL), "40 min on battery, −1 % (1.5 %/h)"))
 t("last sleep: on AC, the levels", () =>

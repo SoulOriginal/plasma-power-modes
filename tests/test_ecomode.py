@@ -1260,8 +1260,13 @@ procs = eco.parse_nvsmi_processes(NVSMI)
 check("driver list: pid, path (spaces kept) and type",
       procs == [(1095, "/usr/lib/Xorg", "G"), (1350, "/usr/bin/kwin_wayland", "C+G"),
                 (4321, "/opt/my app/bin/render job", "C")], procs)
-check("driver list: nothing parsed from junk", eco.parse_nvsmi_processes("no gpu\n") == []
-      and eco.parse_nvsmi_processes(None) == [])
+check("driver list: no table at all is not an empty list", eco.parse_nvsmi_processes("no gpu\n") is None
+      and eco.parse_nvsmi_processes(None) is None)
+check("driver list: a table with no processes is empty",
+      eco.parse_nvsmi_processes("| Processes: |\n|  No running processes found |\n") == [])
+check("driver list: a row it cannot read makes the list unknown",
+      eco.parse_nvsmi_processes("| Processes: |\n|    0   N/A  N/A   1095   X   /usr/lib/Xorg  4MiB |\n")
+      is None)
 mine = [{"pid": 77, "name": "blender", "count": 1, "awake": True, "follower": False, "note": None}]
 merged = eco.merge_driver_holders(mine, procs, False)
 names = [(h["name"], h["awake"]) for h in merged]
@@ -1497,6 +1502,25 @@ check("charge-history: the window and the levels for the chart",
       and isinstance(res["points"], list), res)
 check("charge-history: the capacity record comes with it", isinstance(res["health"], list)
       and all(len(r) == 3 for r in res["health"]), res["health"])
+check("charge-history: sleeps over the whole week, whatever the chart window",
+      all(r[5] in ("sleep", "wake", "start") for r in res["sleeps"]), res["sleeps"])
+
+real_which = eco.shutil.which
+eco.shutil.which = lambda name: "/usr/bin/" + name
+RUNS.calls.clear()
+RUNS.replies[("powerprofilesctl", "set")] = (0, "", "")
+res = capture(eco.cmd_set_profile, argparse.Namespace(json=True, profile="power-saver"))
+check("set-profile: the slider moves, the step answers ok",
+      res == {"ok": True, "profile": "power-saver"}
+      and RUNS.ran("powerprofilesctl", "set", "power-saver"), (res, RUNS.calls))
+RUNS.replies[("powerprofilesctl", "set")] = (1, "", "Failed to set profile")
+res = capture(eco.cmd_set_profile, argparse.Namespace(json=True, profile="balanced"))
+check("set-profile: a failure says what and why",
+      not res["ok"] and "balanced" in res["reason"] and "Failed to set" in res["reason"], res)
+eco.shutil.which = lambda name: None
+res = capture(eco.cmd_set_profile, argparse.Namespace(json=True, profile="balanced"))
+check("set-profile: no daemon tool, said plainly", not res["ok"] and "powerprofilesctl" in res["reason"], res)
+eco.shutil.which = real_which
 
 # The service on stop: the limit holds above the stop level, never below it.
 def run_service_once(capacity, enabled=True, stop=80):

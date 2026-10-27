@@ -158,19 +158,9 @@ PlasmoidItem {
             maxPct: maxPct, fans: fansMode, gpuBoost: gpuBoost, status: status,
             force: force === true
         })
-        // Two-way sync: the slider first. A profile write makes the firmware
-        // reset the CPU limits, so Eco has to come after it, not before. The
-        // mode change goes ahead even if the daemon is not there.
-        const profile = Modes.profileCommand(target, kdeProfile, syncProfile)
-        if (profile === null) {
-            runSequence(cmds)
-            return
-        }
-        busy = true
-        runCmd(profile, function() {
-            busy = false
-            runSequence(cmds)
-        })
+        // Two-way sync: the slider is one more step, placed by withProfile().
+        runSequence(Modes.withProfile(cmds,
+            Modes.profileCommand(helper, target, kdeProfile, syncProfile), mode))
     }
 
     // Middle click on the panel.

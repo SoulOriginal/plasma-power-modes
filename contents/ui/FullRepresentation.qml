@@ -613,7 +613,9 @@ Item {
                     opacity: 0.6
                     font: Kirigami.Theme.smallFont
                     text: full.dgpu.holders_complete
-                          ? "Nothing keeps it awake; it should power down in a few seconds."
+                          ? "Nothing has a context on it, so it should power down in a few "
+                            + "seconds; a system process that only keeps it open would not "
+                            + "show here."
                           : "No process of yours holds it; it should power down shortly "
                             + "(system processes are not visible here)."
                 }
@@ -645,14 +647,14 @@ Item {
                 }
                 Stat {
                     readonly property string text: Modes.lastSleepText(
-                        root.chargeHistory ? root.chargeHistory.points : null)
+                        root.chargeHistory ? root.chargeHistory.sleeps : null)
                     visible: text !== ""
                     label: "Last sleep"
                     value: text
                 }
                 Stat {
                     readonly property string text: Modes.sleepDrainText(
-                        root.chargeHistory ? root.chargeHistory.points : null)
+                        root.chargeHistory ? root.chargeHistory.sleeps : null)
                     visible: text !== ""
                     label: "Asleep on battery"
                     value: text

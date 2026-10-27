@@ -2495,12 +2495,28 @@ print("\n\033[1m45. full speed left over from an earlier session\033[0m")
 keeper, hw, ppd, store, clock = make(fans="auto")
 hw.ec_max = True
 keeper.start(4242)
-check("an auto session's hold while the EC holds full speed: recorded as re-arming it",
-      store.state["fans_armed_until"] == 1000 + mx.FAN_RELEASE_SECS, store.state)
+check("an auto session that finds full speed on: silent first, no hold, no 0x10",
+      not ppd.held and store.state["pause_reason"] == "fans settling", (ppd.log, store.state))
+clock.now += mx.FAN_RELEASE_SECS + 1
+keeper.tick()
+check("... once only: still full speed after the wait, Max goes on",
+      len(ppd.held) == 1, ppd.log)
+check("... and its hold, with the EC at full speed, is recorded as re-arming it",
+      store.state["fans_armed_until"] == int(clock.now) + mx.FAN_RELEASE_SECS, store.state)
 clock.now += 10
 keeper.stop("off")
 check("... and its release, at the end, too",
-      store.last["fans_armed_until"] == 1010 + mx.FAN_RELEASE_SECS, store.last)
+      store.last["fans_armed_until"] == int(clock.now) + mx.FAN_RELEASE_SECS, store.last)
+
+keeper, hw, ppd, store, clock = make(fans="auto")
+hw.ec_max = True
+keeper.start(4242)
+hw.ec_max = False                 # the EC lets go during the wait
+clock.now += mx.FAN_RELEASE_SECS + 1
+keeper.tick()
+check("the EC let go during the wait: Max holds, nothing re-armed",
+      len(ppd.held) == 1 and store.state["fans_armed_until"] is None
+      and store.state["settle_until"] is None, store.state)
 
 keeper, hw, ppd, store, clock = make(fans="auto")
 hw.ec_max = False
@@ -2518,9 +2534,11 @@ check("no reading from the EC: as before, nothing assumed",
 
 S = mx.settle_needed
 rec = {"fans_armed_until": 1040}
-check("settle: the EC at full speed beats a short record",
-      S("auto", rec, 1000, True) == mx.FAN_RELEASE_SECS
-      and S("boost", None, 1000, True) == mx.FAN_RELEASE_SECS)
+check("settle: the record's remainder when it has one",
+      S("auto", rec, 1000, True) == 40)
+check("settle: no record, the EC at full speed - a whole hand-back",
+      S("auto", None, 1000, True) == mx.FAN_RELEASE_SECS
+      and S("boost", {"fans_armed_until": 900}, 1000, True) == mx.FAN_RELEASE_SECS)
 check("settle: the EC on its curve - the record decides",
       S("auto", rec, 1000, False) == 40 and S("auto", None, 1000, False) == 0)
 check("settle: no reading - the record decides", S("auto", rec, 1000, None) == 40)

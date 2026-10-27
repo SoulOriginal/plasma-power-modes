@@ -142,6 +142,8 @@ class Keeper:
         self.fans_armed_until = None
         # While set, Max is silent so that the EC can take the fans back.
         self.settle_until = None
+        # One extra wait per session at most, for full speed found still on.
+        self.resettled = False
         self.cool_since = None      # boost: since when it has been cool
 
     def now(self):
@@ -174,6 +176,14 @@ class Keeper:
             self.cool_since = None
             self._pause("battery")
         elif self.settle_until is not None and self.now() < self.settle_until:
+            self._pause("fans settling")
+        elif (self.fans != "max" and not self.fans_hot and not self.resettled
+              and self.hw.fans_at_max() is True):
+            # Full speed this session did not ask for, and every tick of ours
+            # would keep it: be silent for one hand-back. Once only - if the
+            # EC still holds it after that, it is not ours, and Max goes on.
+            self.resettled = True
+            self.settle_until = self.now() + FAN_RELEASE_SECS
             self._pause("fans settling")
         else:
             self.settle_until = None
@@ -866,11 +876,12 @@ def settle_for(fans, last, now):
 
 
 def settle_needed(fans, last, now, ec_at_max):
-    """settle_for(), checked against the EC itself: while it holds full speed
-    now, an "auto" or "boost" session waits a whole hand-back however short
-    the record says - the record misses what it did not cause."""
+    """settle_for(), checked against the EC itself: the record's remainder
+    when it has one; with none, while the EC holds full speed now, an "auto"
+    or "boost" session waits a whole hand-back - the record misses what it
+    did not cause."""
     settle = settle_for(fans, last, now)
-    if fans != "max" and ec_at_max is True:
+    if settle == 0 and fans != "max" and ec_at_max is True:
         return FAN_RELEASE_SECS
     return settle
 
