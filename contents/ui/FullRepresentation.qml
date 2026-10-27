@@ -478,6 +478,15 @@ Item {
                     value: (full.fans.rpm || []).join(" / ") + " RPM"
                            + (full.fans.pwm_enable === "0" ? "  (full speed)" : "")
                 }
+                PC3.Label {
+                    readonly property string why: Modes.fanHoldText(st, full.nowSec)
+                    visible: why !== ""
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    opacity: 0.7
+                    font: Kirigami.Theme.smallFont
+                    text: why
+                }
                 Stat {
                     visible: full.has(full.cpu.throttle_ms)
                     label: "Hot since boot"

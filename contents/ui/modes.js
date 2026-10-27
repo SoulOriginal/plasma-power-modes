@@ -259,6 +259,21 @@ function levelText(level, maxPct) {
            "budget, so interactive work feels unchanged. The dGPU is untouched."
 }
 
+// Why the fans run at full speed when no Max with "max" fans asks for it:
+// the EC holds full speed until two minutes pass without a Max change.
+// "" when they are not at full speed, or Max asks for it right now.
+function fanHoldText(st, nowSec) {
+    var fans = (st && st.fans) || {}
+    if (fans.pwm_enable !== "0") return ""
+    var m = st.max
+    if (m && m.fans_state === "max") return ""
+    var armed = (m && m.fans_armed_until) || (st.max_last && st.max_last.fans_armed_until)
+    var left = typeof armed === "number" ? Math.ceil(armed - nowSec) : -1
+    if (left > 0)
+        return "Left at full speed after Max: back to auto in about " + left + " s"
+    return "Left at full speed after Max: back to auto about 2 min after the last Max change"
+}
+
 // Collapsed with Max on, the widget reads the keeper's own max.json with
 // `cat` every 30 s instead of running the Python status. The keeper rewrites
 // it every 30 s, so a last tick older than three rounds and a bit means it

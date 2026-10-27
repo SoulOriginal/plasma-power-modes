@@ -64,6 +64,7 @@ class FakeHw:
         self.writes = []          # ("profile" | "pwm", value), in order
         self.all_writes = []      # the same, but never cleared by a scenario
         self.fail = set()         # {"profile", "pwm"}: make those writes fail
+        self.ec_max = None        # what the EC says about full speed; None = no reading
 
     def _log(self, entry):
         self.writes.append(entry)
@@ -85,6 +86,9 @@ class FakeHw:
             return False, "[Errno 22] Invalid argument"
         self.pwm = value
         return True, None
+
+    def fans_at_max(self):
+        return self.ec_max
 
     def on_ac(self):
         return self.ac
@@ -2480,6 +2484,47 @@ check("the record carries what limits the CPU and the GPU's state",
 eco.cpu_limit_now = real_limit
 eco.gpu_runtime, eco.gpu_holders, eco.gpu_query = ORIG_GPU
 reset()
+
+# ---------------------------------------------------------------------------
+print("\n\033[1m45. full speed left over from an earlier session\033[0m")
+# 2026-10-25: a 7 s "max" session, then Max toggled with fans "auto" five
+# times; the fans stayed at full speed until 126 s after the last toggle and
+# the widget did not know. The EC's own word (pwm1_enable reads 0 at full
+# speed) now counts, not only what this session commanded.
+
+keeper, hw, ppd, store, clock = make(fans="auto")
+hw.ec_max = True
+keeper.start(4242)
+check("an auto session's hold while the EC holds full speed: recorded as re-arming it",
+      store.state["fans_armed_until"] == 1000 + mx.FAN_RELEASE_SECS, store.state)
+clock.now += 10
+keeper.stop("off")
+check("... and its release, at the end, too",
+      store.last["fans_armed_until"] == 1010 + mx.FAN_RELEASE_SECS, store.last)
+
+keeper, hw, ppd, store, clock = make(fans="auto")
+hw.ec_max = False
+keeper.start(4242)
+clock.now += 10
+keeper.stop("off")
+check("the EC on its own curve: nothing recorded",
+      store.last["fans_armed_until"] is None, store.last)
+
+keeper, hw, ppd, store, clock = make(fans="auto")
+keeper.start(4242)
+keeper.stop("off")
+check("no reading from the EC: as before, nothing assumed",
+      store.last["fans_armed_until"] is None, store.last)
+
+S = mx.settle_needed
+rec = {"fans_armed_until": 1040}
+check("settle: the EC at full speed beats a short record",
+      S("auto", rec, 1000, True) == mx.FAN_RELEASE_SECS
+      and S("boost", None, 1000, True) == mx.FAN_RELEASE_SECS)
+check("settle: the EC on its curve - the record decides",
+      S("auto", rec, 1000, False) == 40 and S("auto", None, 1000, False) == 0)
+check("settle: no reading - the record decides", S("auto", rec, 1000, None) == 40)
+check("settle: a max session never waits", S("max", rec, 1000, True) == 0)
 
 # ---------------------------------------------------------------------------
 print(f"\n\033[1m{PASS} passed, {FAIL} failed\033[0m")

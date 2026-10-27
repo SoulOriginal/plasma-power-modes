@@ -387,4 +387,21 @@ t("sync: a slider moved by the widget is followed back to the same mode", () => 
     assert.equal(m.followTarget("power-saver", { mode: "eco" }), "eco")   // re-check only
 })
 
+// ── Fans left at full speed after Max ───────────────────────────────────────
+t("fans: not at full speed, nothing to say", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "2" } }, 1000), ""))
+t("fans: Max with max fans asks for it, nothing to say", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" }, max: { fans_state: "max" } }, 1000), ""))
+t("fans: left over, with the time from the last session's record", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" }, max: null,
+                                 max_last: { fans_armed_until: 1095 } }, 1000),
+                 "Left at full speed after Max: back to auto in about 95 s"))
+t("fans: a running auto session that is settling gives its own time", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" },
+                                 max: { fans_state: "auto", fans_armed_until: 1030 } }, 1000),
+                 "Left at full speed after Max: back to auto in about 30 s"))
+t("fans: no record, or it ran out - say what the rule is", () =>
+    assert.match(m.fanHoldText({ fans: { pwm_enable: "0" }, max_last: { fans_armed_until: 900 } }, 1000),
+                 /about 2 min after the last Max change$/))
+
 console.log(`\n${passed} passed`)

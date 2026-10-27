@@ -201,8 +201,12 @@ class Keeper:
     def _reached_ec(self):
         """A hold, a release (the daemon writes the profile for both), a
         profile rewrite or a fan write has just reached the EC: at full
-        speed, that keeps the fans there FAN_RELEASE_SECS past now."""
-        if self.fans_hot:
+        speed, that keeps the fans there FAN_RELEASE_SECS past now. Full
+        speed is what the EC says, not only what this session commands: one
+        left over from an earlier session is kept there just the same, and
+        the record has to say so (seen: every Max toggle after a "max"
+        session kept the fans at full speed two more minutes, unannounced)."""
+        if self.fans_hot or self.hw.fans_at_max() is True:
             self.fans_armed_until = self.now() + FAN_RELEASE_SECS
 
     def _keep_alive(self):
@@ -456,6 +460,12 @@ class SysfsHw:
         if not self.pwm_path:
             return False, "no hp fan control"
         return eco.write_path(self.pwm_path, value)
+
+    def fans_at_max(self):
+        """What the EC says: True while it holds full speed, False on its own
+        curve, None without a reading. hp-wmi reads this from the firmware."""
+        return {"0": True, "2": False}.get(
+            eco.read_path(self.pwm_path) if self.pwm_path else None)
 
     def on_ac(self):
         return eco.on_ac()
@@ -855,6 +865,16 @@ def settle_for(fans, last, now):
     return max(0, min(math.ceil(armed - now), FAN_RELEASE_SECS))
 
 
+def settle_needed(fans, last, now, ec_at_max):
+    """settle_for(), checked against the EC itself: while it holds full speed
+    now, an "auto" or "boost" session waits a whole hand-back however short
+    the record says - the record misses what it did not cause."""
+    settle = settle_for(fans, last, now)
+    if fans != "max" and ec_at_max is True:
+        return FAN_RELEASE_SECS
+    return settle
+
+
 def watts_run_cmd(uid, interval):
     return transient_unit_cmd(WATTS_UNIT, "CPU package watts sampler", uid,
                               f"-/usr/bin/rm -f {eco.WATTS_FILE}",
@@ -928,7 +948,9 @@ def cmd_on(args):
 
     # Read before it goes below: it may say the EC still holds the fans at
     # full speed - also for the session stopped just above.
-    settle = settle_for(args.fans, eco.read_json(eco.MAX_LAST_FILE), time.time())
+    hwmon = eco.find_hp_hwmon()
+    settle = settle_needed(args.fans, eco.read_json(eco.MAX_LAST_FILE), time.time(),
+                           SysfsHw(hwmon).fans_at_max() if hwmon else None)
     FileStore().clear()
     eco.make_state_dir()
     sh(["systemctl", "reset-failed", UNIT])
