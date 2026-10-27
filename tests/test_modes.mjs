@@ -404,4 +404,31 @@ t("fans: no record, or it ran out - say what the rule is", () =>
     assert.match(m.fanHoldText({ fans: { pwm_enable: "0" }, max_last: { fans_armed_until: 900 } }, 1000),
                  /about 2 min after the last Max change$/))
 
+// ── Battery use while asleep ────────────────────────────────────────────────
+const SL = [
+    [0, 80, true, "inhibit-charge", "Not charging", "sleep"],
+    [31500, 80, true, "auto", "Not charging", "wake"],          // 8 h 45 min on AC
+    [40000, 74, false, "auto", "Discharging", "sleep"],
+    [42400, 73, false, "auto", "Discharging", "wake"],          // 40 min on battery
+    [50000, 70, false, "auto", "Discharging", "sleep"],
+    [60000, 60, false, "auto", "Discharging", "start"],         // never woke
+]
+t("sleeps: pairs, a sleep with no wake is dropped", () =>
+    assert.deepEqual(m.chargeSleeps(SL).map(s => [s.secs, s.from, s.to, s.ac]),
+                     [[31500, 80, 80, true], [2400, 74, 73, false]]))
+t("last sleep: on battery, with its rate", () =>
+    assert.equal(m.lastSleepText(SL), "40 min on battery, −1 % (1.5 %/h)"))
+t("last sleep: on AC, the levels", () =>
+    assert.equal(m.lastSleepText(SL.slice(0, 2)), "8 h 45 min on AC, 80 % → 80 %"))
+t("last sleep: too short for a rate", () =>
+    assert.equal(m.lastSleepText([[0, 50, false, "a", "D", "sleep"], [600, 50, false, "a", "D", "wake"]]),
+                 "10 min on battery, ±0 %"))
+t("drain: under an hour of sleeps on battery says nothing", () =>
+    assert.equal(m.sleepDrainText(SL), ""))
+t("drain: weighted by time over the sleeps on battery", () =>
+    assert.equal(m.sleepDrainText(SL.concat([
+        [70000, 60, false, "a", "D", "sleep"], [77200, 52, false, "a", "D", "wake"]])),
+        "3.4 %/h over 2 sleeps on battery"))
+t("sleeps: no history", () => assert.equal(m.lastSleepText(null), ""))
+
 console.log(`\n${passed} passed`)

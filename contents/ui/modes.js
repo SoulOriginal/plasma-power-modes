@@ -388,6 +388,55 @@ function chargeSeries(points, now, hours) {
     return { from: from, to: now, steps: steps, sleeps: sleeps, marks: marks }
 }
 
+// Sleeps from the history: pairs of a "sleep" row and the "wake" after it,
+// as { t, secs, from, to, ac } (ac: on AC when it went to sleep).
+function chargeSleeps(points) {
+    var rows = points || [], out = [], start = null
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i]
+        if (r[5] === "sleep") start = r
+        else if (r[5] === "start") start = null      // never woke: no pair
+        else if (r[5] === "wake" && start) {
+            out.push({ t: start[0], secs: r[0] - start[0], from: start[1], to: r[1],
+                       ac: start[2] === true })
+            start = null
+        }
+    }
+    return out
+}
+
+function sleepDuration(secs) {
+    var m = Math.round(secs / 60), h = Math.floor(m / 60)
+    return h > 0 ? h + " h " + (m % 60 < 10 ? "0" : "") + m % 60 + " min" : m + " min"
+}
+
+// "8 h 45 min on AC, 80 % → 80 %" or "40 min on battery, −1 % (1.5 %/h)".
+// A rate only from 30 min up: the charge moves in whole percent.
+function lastSleepText(points) {
+    var sl = chargeSleeps(points)
+    if (!sl.length) return ""
+    var s = sl[sl.length - 1]
+    var text = sleepDuration(s.secs) + (s.ac ? " on AC, " : " on battery, ")
+    if (s.ac) return text + s.from + " % \u2192 " + s.to + " %"
+    var lost = s.from - s.to
+    text += (lost > 0 ? "\u2212" + lost : lost < 0 ? "+" + (-lost) : "\u00b10") + " %"
+    if (s.secs >= 1800) text += " (" + (Math.round(lost / (s.secs / 3600) * 10) / 10) + " %/h)"
+    return text
+}
+
+// Average drain over the sleeps on battery in the history, weighted by time:
+// "1.4 %/h over 3 sleeps on battery", or "" with under an hour of them.
+function sleepDrainText(points) {
+    var secs = 0, lost = 0, n = 0
+    chargeSleeps(points).forEach(function(s) {
+        if (s.ac) return
+        secs += s.secs; lost += s.from - s.to; n++
+    })
+    if (secs < 3600) return ""
+    return (Math.round(lost / (secs / 3600) * 10) / 10) + " %/h over " + n
+        + (n === 1 ? " sleep" : " sleeps") + " on battery"
+}
+
 // The reading at time t for the hover line, or null outside the data.
 function chargeAt(points, t) {
     var rows = points || [], hit = null

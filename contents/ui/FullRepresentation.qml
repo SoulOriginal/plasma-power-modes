@@ -644,6 +644,20 @@ Item {
                         ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.textColor
                 }
                 Stat {
+                    readonly property string text: Modes.lastSleepText(
+                        root.chargeHistory ? root.chargeHistory.points : null)
+                    visible: text !== ""
+                    label: "Last sleep"
+                    value: text
+                }
+                Stat {
+                    readonly property string text: Modes.sleepDrainText(
+                        root.chargeHistory ? root.chargeHistory.points : null)
+                    visible: text !== ""
+                    label: "Asleep on battery"
+                    value: text
+                }
+                Stat {
                     // From the Battery care log's capacity record.
                     readonly property string trend: Modes.healthTrend(
                         root.chargeHistory ? root.chargeHistory.health : null)
