@@ -649,6 +649,13 @@ CHARGE_AUTO, CHARGE_INHIBIT = "auto", "inhibit-charge"
 # trimmed in place, so it stays one file of a few dozen KB.
 CHARGE_HISTORY = os.path.join(CHARGE_DIR, "charge-history")
 CHARGE_HISTORY_DAYS = 7
+# With the log on, also the battery's capacity as its own controller estimates
+# it (energy_full): one line whenever the estimate changes, and one a day. It
+# changes only now and then, so this catches every change; 400 days of it is
+# about 10 KB, enough to see how fast the battery ages over months.
+CHARGE_HEALTH = os.path.join(CHARGE_DIR, "battery-health")
+CHARGE_HEALTH_DAYS = 400
+CHARGE_HEALTH_STEP = 0.1      # Wh: about 0.1 % of a laptop battery
 CHARGE_STEP = 5               # a log line per 5 % while charging or discharging
 CHARGE_HEARTBEAT = 3600       # and one an hour when nothing else happened
 CHARGE_CONFIRM_SECS = 120     # firmware that has not followed a write by then
@@ -856,28 +863,39 @@ def parse_history_line(line):
             None if parts[5] == "-" else parts[5]]
 
 
-def history_append(t, s, event=None):
-    """One line onto the history; under a lock, since the sleep hook writes
-    too. A failed write costs a chart point, nothing else."""
+def append_line(path, text):
+    """One line onto a history file, under a lock since the sleep hook
+    writes too. True if it was written; a failed write costs a point."""
     try:
         os.makedirs(CHARGE_DIR, exist_ok=True)
-        fd = os.open(CHARGE_HISTORY, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         with os.fdopen(fd, "a") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
-            fh.write(history_line(t, s, event))
+            fh.write(text)
+        return True
     except OSError:
-        pass
+        return False
 
 
-def history_trim(now, days=CHARGE_HISTORY_DAYS):
+def read_rows(path, parse, since=0):
+    """The parsed rows of a history file from `since` on; damaged lines skipped."""
+    try:
+        with open(path) as fh:
+            rows = [parse(ln) for ln in fh]
+    except OSError:
+        return []
+    return [r for r in rows if r is not None and r[0] >= since]
+
+
+def trim_rows(path, parse, now, days):
     """Drop what is older than `days`, rewriting the file in place."""
     cutoff = now - days * 86400
     try:
-        with open(CHARGE_HISTORY, "r+") as fh:
+        with open(path, "r+") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
             lines = fh.readlines()
             keep = [ln for ln in lines
-                    if (p := parse_history_line(ln)) is not None and p[0] >= cutoff]
+                    if (p := parse(ln)) is not None and p[0] >= cutoff]
             if len(keep) != len(lines):
                 fh.seek(0)
                 fh.writelines(keep)
@@ -886,13 +904,70 @@ def history_trim(now, days=CHARGE_HISTORY_DAYS):
         pass
 
 
+def history_append(t, s, event=None):
+    return append_line(CHARGE_HISTORY, history_line(t, s, event))
+
+
 def history_read(since):
+    return read_rows(CHARGE_HISTORY, parse_history_line, since)
+
+
+def history_trim(now, days=CHARGE_HISTORY_DAYS):
+    trim_rows(CHARGE_HISTORY, parse_history_line, now, days)
+
+
+def battery_capacity_wh(bat):
+    """(full, design) in Wh as the battery's controller reports them, or
+    (None, None) where it reports energy in another way (charge_full)."""
+    full, design = _uw(f"{bat}/energy_full"), _uw(f"{bat}/energy_full_design")
+    if not full or not design:
+        return None, None
+    return round(full / 1e6, 2), round(design / 1e6, 2)
+
+
+def parse_health_line(line):
+    """[t, full Wh, design Wh] or None for a damaged line."""
+    parts = line.split()
+    if len(parts) != 3:
+        return None
     try:
-        with open(CHARGE_HISTORY) as fh:
-            rows = [parse_history_line(ln) for ln in fh]
-    except OSError:
-        return []
-    return [r for r in rows if r is not None and r[0] >= since]
+        return [int(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError:
+        return None
+
+
+def health_due(last, now, full_wh):
+    """A capacity line is due when the estimate moved by CHARGE_HEALTH_STEP
+    or more, or on a new day. The step keeps a controller that jitters by a
+    few mWh from writing a line every round."""
+    if last is None or abs(last[1] - full_wh) >= CHARGE_HEALTH_STEP:
+        return True
+    return time.localtime(last[0])[:3] != time.localtime(now)[:3]
+
+
+def health_append(t, full_wh, design_wh):
+    return append_line(CHARGE_HEALTH, f"{int(t)} {full_wh:.2f} {design_wh:.2f}\n")
+
+
+def health_read(since=0):
+    return read_rows(CHARGE_HEALTH, parse_health_line, since)
+
+
+def health_round(bat, now, last):
+    """One capacity check for the service: (new last row, log line or None)."""
+    full, design = battery_capacity_wh(bat)
+    if full is None or not health_due(last, now, full):
+        return last, None
+    if not health_append(now, full, design):
+        return last, None             # not written: try again next round
+    line = None
+    if last is not None and abs(last[1] - full) >= CHARGE_HEALTH_STEP:
+        line = (f"battery capacity estimate changed: {last[1]:.2f} -> {full:.2f} Wh "
+                f"({100 * full / design:.1f} % of the {design:.0f} Wh design)")
+    elif last is None:
+        line = (f"battery capacity: {full:.2f} Wh, {100 * full / design:.1f} % of the "
+                f"{design:.0f} Wh design (recorded daily and on every change)")
+    return [int(now), full, design], line
 
 
 class ChargeWatch:
@@ -1634,7 +1709,8 @@ def cmd_charge_history(args):
     rows = history_read(now - args.hours * 3600)
     emit({"now": int(now), "hours": args.hours, "stop": conf["stop"],
           "resume": conf["stop"] - CHARGE_HYSTERESIS, "log": conf["log"],
-          "enabled": conf["enabled"], "points": rows}, args)
+          "enabled": conf["enabled"], "points": rows,
+          "health": health_read(now - CHARGE_HEALTH_DAYS * 86400)}, args)
     return 0
 
 
@@ -1654,6 +1730,7 @@ def cmd_charge_run(args):
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     last_error, watch, last_trim, logging = None, ChargeWatch(), 0.0, None
+    health_last = (health_read() or [None])[-1]
     # A fresh start cannot be in the middle of a suspend: a leftover from a
     # sleep the machine never woke from is stale.
     with contextlib.suppress(OSError):
@@ -1676,8 +1753,12 @@ def cmd_charge_run(args):
                     charge_log_line(line, err=line.startswith("warning"))
                 if event is not None:
                     history_append(now, watch.prev, event or None)
+                health_last, line = health_round(bat, now, health_last)
+                if line:
+                    charge_log_line(line)
                 if now - last_trim >= CHARGE_HEARTBEAT:
                     history_trim(now)
+                    trim_rows(CHARGE_HEALTH, parse_health_line, now, CHARGE_HEALTH_DAYS)
                     last_trim = now
             elif written:
                 charge_log_line(f"ecomode charge: {written} at "

@@ -341,4 +341,30 @@ t("hover text", () => {
     assert.match(txt, /^\d\d:\d\d · 80 % · charging · charging stopped at the limit$/)
 })
 
+const D1 = 86400, oct26 = new Date(2026, 9, 26, 12).getTime() / 1000
+t("health trend: nothing before a day of records", () => {
+    assert.equal(m.healthTrend(null), "")
+    assert.equal(m.healthTrend([[oct26, 66.53, 83]]), "")
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 3600, 66.2, 83]]), "")
+})
+t("health trend: a loss, in % of design, since the first record", () =>
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 40 * D1, 66.2, 83]]),
+                 "−0.4 % of design since Oct 26"))
+t("health trend: unchanged", () =>
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 66.53, 83]]),
+                 "no change since Oct 26"))
+t("health trend: a replaced battery starts its own trend", () =>
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 89, 90],
+                                [oct26 + 4 * D1, 88.5, 90]]),
+                 "\u22120.6 % of design since Oct 28"))
+t("health trend: losses and gains round alike", () => {
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 66.49, 83]]),
+                 "no change since Oct 26")
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 66.44, 83]]),
+                 "\u22120.1 % of design since Oct 26")
+})
+t("health trend: a recalibration upwards shows as such", () =>
+    assert.equal(m.healthTrend([[oct26, 66.53, 83], [oct26 + 2 * D1, 67.4, 83]]),
+                 "+1 % of design since Oct 26"))
+
 console.log(`\n${passed} passed`)

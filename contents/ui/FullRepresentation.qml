@@ -626,6 +626,14 @@ Item {
                         ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.textColor
                 }
                 Stat {
+                    // From the Battery care log's capacity record.
+                    readonly property string trend: Modes.healthTrend(
+                        root.chargeHistory ? root.chargeHistory.health : null)
+                    visible: trend !== ""
+                    label: "Health trend"
+                    value: trend
+                }
+                Stat {
                     label: "Total draw"
                     value: full.live && full.has(full.live.battery_w)
                         ? full.w(full.live.battery_w)

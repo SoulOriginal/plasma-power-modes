@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 HELPER = HERE.parent / "backend" / "ecomode"
@@ -1117,6 +1118,7 @@ def fake_battery(capacity=50, status="Charging", ac="1", behaviour="[auto] inhib
     eco.CHARGE_CONF = str(ROOT / "varlib" / "charge.json")
     eco.CHARGE_HISTORY = str(ROOT / "varlib" / "charge-history")
     eco.CHARGE_SLEEP_FILE = str(ROOT / "varlib" / "charge-sleep.json")
+    eco.CHARGE_HEALTH = str(ROOT / "varlib" / "battery-health")
     return ps / "BAT1"
 
 
@@ -1330,6 +1332,51 @@ eco.history_trim(150 + 7 * 86400, days=7)
 check("trim drops what is older than the window",
       [r[0] for r in eco.history_read(0)] == [200], eco.history_read(0))
 
+# Capacity as the battery's controller estimates it: every change, and daily.
+DAY = 86400
+noon = time.mktime((2026, 10, 26, 12, 0, 0, 0, 0, -1))
+check("health: due with nothing recorded", eco.health_due(None, noon, 66.53))
+check("health: not due again the same day", not eco.health_due([noon, 66.53, 83.0], noon + 3600, 66.53))
+check("health: due at once when the estimate changes",
+      eco.health_due([noon, 66.53, 83.0], noon + 60, 66.2))
+check("health: a few mWh of jitter is not a change",
+      not eco.health_due([noon, 66.53, 83.0], noon + 60, 66.48))
+check("health: due on the next day", eco.health_due([noon, 66.53, 83.0], noon + DAY, 66.53))
+check("health: capacity in Wh from energy_full", eco.battery_capacity_wh(bat) == (65.0, 83.0))
+last, line = eco.health_round(bat, noon, None)
+check("health: the first record is logged once",
+      last == [int(noon), 65.0, 83.0] and line.startswith("battery capacity: 65.00 Wh, 78.3 %"), line)
+last, line = eco.health_round(bat, noon + 30, last)
+check("health: an unchanged estimate the same day writes nothing", line is None
+      and len(eco.health_read()) == 1)
+(bat / "energy_full").write_text("64500000")
+last, line = eco.health_round(bat, noon + 60, last)
+check("health: a change is logged with both values",
+      line == "battery capacity estimate changed: 65.00 -> 64.50 Wh (77.7 % of the 83 Wh design)", line)
+eco.health_round(bat, noon + DAY, last)
+check("health: the daily line, nothing logged for it",
+      [r[1] for r in eco.health_read()] == [65.0, 64.5, 64.5])
+with open(eco.CHARGE_HEALTH, "a") as fh:
+    fh.write("garbage\n")
+check("health: damaged lines are skipped", len(eco.health_read()) == 3)
+eco.trim_rows(eco.CHARGE_HEALTH, eco.parse_health_line, noon + 400 * DAY + 30, eco.CHARGE_HEALTH_DAYS)
+check("health: trimmed after 400 days", [r[0] for r in eco.health_read()]
+      == [int(noon + 60), int(noon + DAY)], eco.health_read())
+rows_before = len(eco.health_read())
+(bat / "energy_full").unlink()
+check("health: a battery without energy_full is skipped, nothing written",
+      eco.health_round(bat, noon + 2 * DAY, None) == (None, None)
+      and len(eco.health_read()) == rows_before)
+(bat / "energy_full").write_text("65000000")
+real_append = eco.append_line
+eco.append_line = lambda path, text: False
+last = [int(noon), 65.0, 83.0]
+(bat / "energy_full").write_text("64000000")
+check("health: a failed write is retried, not logged as recorded",
+      eco.health_round(bat, noon + 3 * DAY, last) == (last, None))
+eco.append_line = real_append
+(bat / "energy_full").write_text("65000000")
+
 # The sleep hook: holds charging before suspend, the service restores it.
 eco.save_charge_conf({"enabled": True, "stop": 80, "log": True})
 (ROOT / "ps" / "ACAD" / "online").write_text("1")
@@ -1419,6 +1466,8 @@ res = capture(eco.cmd_charge_history, argparse.Namespace(json=True, hours=24))
 check("charge-history: the window and the levels for the chart",
       res["stop"] == 80 and res["resume"] == 75 and res["hours"] == 24
       and isinstance(res["points"], list), res)
+check("charge-history: the capacity record comes with it", isinstance(res["health"], list)
+      and all(len(r) == 3 for r in res["health"]), res["health"])
 
 # The service on stop: the limit holds above the stop level, never below it.
 def run_service_once(capacity, enabled=True, stop=80):

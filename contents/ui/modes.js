@@ -404,6 +404,25 @@ function batteryLine(b) {
     return parts.join(" · ")
 }
 
+// Capacity as the battery's controller estimated it over time, rows of
+// [t, full Wh, design Wh]: "\u22120.4 % of design since Oct 26", or "" before
+// a day of records. Only the rows of the battery fitted now (same design
+// capacity) count, so a replaced battery starts its own trend.
+function healthTrend(rows) {
+    if (!rows || rows.length < 2) return ""
+    var last = rows[rows.length - 1]
+    var mine = rows.filter(function(r) { return r[2] === last[2] })
+    var first = mine[0]
+    if (last[0] - first[0] < 86400 || !(last[2] > 0)) return ""
+    var d = new Date(first[0] * 1000)
+    var since = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                 "Nov", "Dec"][d.getMonth()] + " " + d.getDate()
+    var raw = (last[1] - first[1]) / last[2] * 100
+    var pct = Math.round(Math.abs(raw) * 10) / 10       // the same rounding both ways
+    if (pct === 0) return "no change since " + since
+    return (raw > 0 ? "+" : "\u2212") + pct + " % of design since " + since
+}
+
 function healthText(b) {
     if (!b || typeof b.health_pct !== "number") return ""
     return b.health_pct + " % of design (" + b.full_wh + " / " + b.design_wh + " Wh)" +
