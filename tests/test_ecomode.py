@@ -515,6 +515,25 @@ check("8BAB with hp-wmi performance is supported",
       st["max_supported"] is True, st.get("max_unsupported_reason"))
 check("... and then no reason is given",
       st["max_unsupported_reason"] is None, st.get("max_unsupported_reason"))
+check("status names the board", st["board"] == "8BAB", st.get("board"))
+check("8BAB: automatic fans cannot be written (Victus-S in hp-wmi)",
+      st["fans"]["auto_writable"] is False, st["fans"])
+fake_max_env(board="8A17", choices="cool quiet balanced performance")
+st = capture(eco.cmd_status, args())
+check("8A17 (OMEN 17-ck1xxx) with hp-wmi performance is supported",
+      st["max_supported"] is True and st["board"] == "8A17",
+      st.get("max_unsupported_reason"))
+check("8A17: automatic fans can be written",
+      st["fans"]["auto_writable"] is True, st["fans"])
+cleanup()
+fake_sysfs(BASE)
+fake_max_env(board="8A17", hwmon=False)
+check("... but not without hp fan control",
+      eco.fan_info()["auto_writable"] is False, eco.fan_info())
+cleanup()
+fake_sysfs(BASE)
+fake_max_env()
+st = capture(eco.cmd_status, args())
 check("max block is null when not running", st["max"] is None, st.get("max"))
 check("fans found by hwmon name, not number",
       st["fans"]["available"] and st["fans"]["rpm"] == [3700, 4000], st["fans"])
@@ -652,7 +671,8 @@ profile = pathlib.Path(eco.PLATFORM_PROFILE)
 real_subprocess, spawns = eco.subprocess, Spawns()
 eco.subprocess = spawns
 try:
-    for value, name in (("low-power", "power-saver"), ("balanced", "balanced"),
+    for value, name in (("low-power", "power-saver"), ("quiet", "power-saver"),
+                        ("cool", "power-saver"), ("balanced", "balanced"),
                         ("performance", "performance")):
         profile.write_text(value)
         spawns.cmds.clear()
@@ -669,7 +689,7 @@ try:
     asked = []
     real_ctl = eco.ppd_profile_ctl
     eco.ppd_profile_ctl = lambda: (asked.append(True), "quiet-from-ppd")[1]
-    profile.write_text("quiet")
+    profile.write_text("custom")
     check("a value the map does not know asks power-profiles-daemon",
           eco.ppd_profile() == "quiet-from-ppd" and asked == [True], asked)
     profile.unlink()

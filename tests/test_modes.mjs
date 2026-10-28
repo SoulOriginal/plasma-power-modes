@@ -418,6 +418,17 @@ t("fans: no time left in the record - only what is known", () =>
 t("fans: no Max ever ran - not blamed on Max", () =>
     assert.equal(m.fanHoldText({ fans: { pwm_enable: "0" }, max: null, max_last: null }, 1000),
                  "Full speed, not set by this widget"))
+t("fans: where automatic can be written, a running Max writes it back", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0", auto_writable: true },
+                                 max: { fans_state: "auto" } }, 1000),
+                 "Full speed: Max puts the fans back to automatic within 30 s"))
+t("fans: where automatic can be written, with Max off - how to put them back", () =>
+    assert.match(m.fanHoldText({ fans: { pwm_enable: "0", auto_writable: true }, max: null,
+                                 max_last: { fans_armed_until: 1095 } }, 1000),
+                 /^Full speed, not set by this widget: pkexec ecomode-max fans auto/))
+t("fans: Max with max fans asks for it there too, nothing to say", () =>
+    assert.equal(m.fanHoldText({ fans: { pwm_enable: "0", auto_writable: true },
+                                 max: { fans_state: "max" } }, 1000), ""))
 
 // ── Battery use while asleep ────────────────────────────────────────────────
 const SL = [

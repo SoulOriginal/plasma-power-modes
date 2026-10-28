@@ -272,13 +272,19 @@ function levelText(level, maxPct) {
 }
 
 // Why the fans run at full speed when no Max with "max" fans asks for it:
-// the EC holds full speed until two minutes pass without a Max change.
-// "" when they are not at full speed, or Max asks for it right now.
+// on a Victus-S board the EC holds full speed until two minutes pass
+// without a Max change; elsewhere (fans.auto_writable) nothing holds them
+// and automatic is simply written back. "" when they are not at full
+// speed, or Max asks for it right now.
 function fanHoldText(st, nowSec) {
     var fans = (st && st.fans) || {}
     if (fans.pwm_enable !== "0") return ""
     var m = st.max
     if (m && m.fans_state === "max") return ""
+    if (fans.auto_writable === true)
+        return m ? "Full speed: Max puts the fans back to automatic within 30 s"
+                 : "Full speed, not set by this widget: pkexec ecomode-max fans auto "
+                   + "puts them back"
     var armed = (m && m.fans_armed_until) || (st.max_last && st.max_last.fans_armed_until)
     var left = typeof armed === "number" ? Math.ceil(armed - nowSec) : -1
     if (left > 0)

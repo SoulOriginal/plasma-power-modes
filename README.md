@@ -4,9 +4,10 @@ A Plasma 6 panel widget with three power modes (Eco, Normal and Max), live CPU
 and GPU watts, a battery charge limit, and a popup that shows what is holding
 the CPU back and what keeps the discrete GPU awake.
 
-It was written for, and measured on, an HP OMEN 16 laptop. Most of it works on
-any Intel laptop with Plasma 6. Parts it cannot confirm on another machine
-switch themselves off, and the popup says why.
+It was written for, and measured on, an HP OMEN 16 laptop, and checked on an
+HP OMEN 17 (board 8A17). Most of it works on any Intel laptop with Plasma 6.
+Parts it cannot confirm on another machine switch themselves off, and the
+popup says why.
 
 <p align="center">
   <img src="assets/panel.png" alt="The widget in the panel: mode dot and watts" width="430"><br>
@@ -20,7 +21,7 @@ switch themselves off, and the popup says why.
 |---|---|
 | Eco | Lowers the CPU's power limits (RAPL PL1/PL2) and frequency ceiling, and at the deeper levels caps the NVIDIA GPU's clocks. Three levels: Gentle, Deep, Deepest. |
 | Normal | Nothing. Everything Eco changed is written back to the exact values it found. |
-| Max | HP OMEN 16-wf0 only. Keeps the laptop's embedded controller in its performance state so the CPU does not fall back to 44 W after two minutes. Optional fan modes and NVIDIA Dynamic Boost. |
+| Max | HP OMEN 16-wf0 and 17-ck1xxx. Keeps the laptop's embedded controller in its performance state (on the 16-wf0 that is what stops the CPU from falling back to 44 W after two minutes). Optional fan modes and NVIDIA Dynamic Boost. |
 
 Alongside the modes:
 
@@ -137,7 +138,54 @@ Fans inside Max can stay automatic, run at full speed, or go to full speed
 from 85 °C until three minutes below 65 °C. Full speed only returns to
 automatic about 2 minutes after the last profile write: on this board the
 `hp-wmi` request for "automatic" stops the fans instead, so the widget never
-sends it and waits for the controller's own timeout.
+sends it and waits for the controller's own timeout. Other boards take that
+request as what it says, and there the widget sends it (next section).
+
+### Max on the HP OMEN 17-ck1xxx (board 8A17)
+
+Hardware: HP OMEN 17-ck1xxx (board 8A17, Core i7-12700H, RTX 3060 Laptop,
+BIOS F.15), Nobara 44 with Linux 7.2, Plasma 6.7, NVIDIA driver 595,
+power-profiles-daemon 0.30. Measured on 2026-10-22, one reading per second
+of RAPL, clocks, temperatures, fans and `nvidia-smi` under `7z b`, `glmark2`
+on the RTX and both at once; the runs and what they showed are in
+[`docs/8A17-measurements.md`](docs/8A17-measurements.md).
+
+| What | Measured |
+|---|---|
+| CPU under full load, any profile, keep-alive or not | 82 to 90 W for 20 to 28 s warm (32 to 37 s after 8 min idle), then 44 to 45 W for the rest of the load, at 59 to 79 °C and falling |
+| The same, first run after boot | 87 W for the whole minute, and 87 W + 97 W (GPU) for 45 s at 90 °C |
+| RAPL PL1/PL2 while capped | 115 W on both the MSR and the MMIO interface; nothing in Linux throttles |
+| GPU alone, every mode | 113 to 118 W average, 128 to 134 W peaks (Dynamic Boost), 2000 to 2050 MHz |
+| Max (performance held) against balanced, 7z | 68 406 against 67 979 MIPS warm: the same |
+| Governor pinned to `performance` under the cap | 16 % slower (57 563 MIPS); the widget does not do that |
+
+The embedded controller caps the CPU at 45 W (the i7-12700H's nominal TDP)
+over PECI some 20 to 40 s into any full load, in every profile, and no
+profile write lifts it; RAPL keeps reading 115 W. So on this board Max does
+not buy sustained CPU power. It is still what keeps the performance profile,
+the fan mode and Dynamic Boost where you put them, and the keep-alive is at
+worst one redundant write every 30 s. The popup says so in the Max card.
+
+**Fans are the real difference.** `hp-wmi` handles them in two families, and
+`pwm1_enable=2` ("automatic") means different things in them:
+
+* On the boards of the driver's Victus-S table (the 16-wf0's 8BAB among
+  them) 2 becomes WMI `0x27 {0}` *and* `0x2E {0x00, 0x00}`, and the 8BAB's
+  controller takes the latter literally and stops the fans. The widget
+  never writes 2 there and waits for the controller's timeout instead, as
+  described above.
+* On every other OMEN (8A17 among them) 2 is `0x27 {0}` alone, the plain
+  "max fans off", and it is the only way back: since Linux 7.x the driver
+  itself re-sends "max fans" every 90 s until that write, so fans left at
+  full speed stay there until the next boot (seen here after a Max session
+  with fans at max). On these boards Max writes 2 whenever the fans should
+  be automatic again: when it ends or pauses, when boost has cooled down,
+  and at the start when an earlier session left them running. `pkexec
+  ecomode-max off` repairs a leftover even with Max already off, and
+  `pkexec ecomode-max fans auto` does it by hand.
+
+`power-saver` reads as `cool` or `quiet` here (the firmware offers no
+`low-power`), and the widget recognises both.
 
 ### Battery care
 
@@ -174,12 +222,13 @@ what it changes and the checks it runs before it replaces anything.
 | PyGObject | Max |
 | NVIDIA's driver with `nvidia-smi` | GPU clock caps, GPU readings, Dynamic Boost |
 | A battery driver with `charge_behaviour` | Battery care |
-| HP OMEN 16-wf0 (board 8BAB) | Max, and the charge control module |
+| HP OMEN 16-wf0 (board 8BAB) or 17-ck1xxx (board 8A17) | Max; the charge control module is for 8BAB only |
 
-Tested on Manjaro. The installer also knows the package names for Arch,
-EndeavourOS, Fedora, openSUSE and Debian or Ubuntu (Plasma 6 releases such as
-Kubuntu 24.10 or later, Debian 13, KDE neon), but those have not been tried.
-Reports are welcome.
+Tested on Manjaro (OMEN 16) and on Nobara 44, a Fedora derivative (OMEN 17,
+Linux 7.2, Plasma 6.7, Python 3.14). The installer also knows the package
+names for Arch, EndeavourOS, openSUSE and Debian or Ubuntu (Plasma 6 releases
+such as Kubuntu 24.10 or later, Debian 13, KDE neon), but those have not been
+tried. Reports are welcome.
 
 ## Install
 
@@ -222,6 +271,8 @@ pkexec ecomode charge on --stop 80   # 50..95
 pkexec ecomode charge off
 pkexec ecomode-max on --fans boost --gpu-boost
 pkexec ecomode-max off
+pkexec ecomode-max fans auto         # fans left at full speed back to automatic
+                                     # (OMEN 17 and other non-Victus-S boards)
 ```
 
 Add `--json` for machine-readable output.
@@ -230,7 +281,7 @@ Add `--json` for machine-readable output.
 
 | Feature | Elsewhere |
 |---|---|
-| Max | Button disabled with the reason. It needs board 8BAB and `hp-wmi` with a performance profile. |
+| Max | Button disabled with the reason. It needs board 8BAB or 8A17 and `hp-wmi` with a performance profile. Another OMEN: see Contributing. |
 | Eco CPU limits | Knobs the machine lacks are skipped. |
 | GPU clock caps | Only on an NVIDIA card (found by PCI vendor and class) on NVIDIA's driver. With nouveau or no NVIDIA card, Eco changes the CPU only. |
 | "Limited by" | Intel only; the register means something else on AMD. |
@@ -266,7 +317,31 @@ control, and with a CPU that is not Intel.
 Issues and pull requests are welcome, especially reports from other laptops:
 what `ecomode status --deep` shows, what works and what does not. If you add
 support for another HP board, please include how you checked the firmware
-(the ACPI methods involved), as `kernel/hp-wmi-charge` does for 8BAB.
+(the ACPI methods involved), as `kernel/hp-wmi-charge` does for 8BAB. For
+Max on another OMEN: the board name (`cat /sys/class/dmi/id/board_name`),
+whether it is in `hp-wmi`'s Victus-S table, whether the fans return to
+automatic after `pkexec ecomode-max off` from a session with fans at max,
+and a minute of CPU load with the watts sampler on, as
+[`docs/8A17-measurements.md`](docs/8A17-measurements.md) does for 8A17.
+
+## Changes
+
+### Unreleased
+
+* **HP OMEN 17-ck1xxx (board 8A17)**: Max is available, measured
+  (`docs/8A17-measurements.md`), with the popup saying what it can and
+  cannot do there.
+* **Fans on non-Victus-S boards** (8A17 among them): `pwm1_enable=2` is the
+  plain "max fans off" there and the only way back, and `hp-wmi` re-sends
+  "max fans" every 90 s until it is written, so fans left at full speed
+  stayed there until the next boot. Max now writes automatic back when it
+  ends, pauses or boost cools down; `ecomode-max off` repairs a leftover,
+  and `ecomode-max fans auto` does it by hand. Boards in the driver's
+  Victus-S table (8BAB) keep the silence rule.
+* `power-saver` is recognised where the firmware offers `quiet` or `cool`
+  instead of `low-power`, so the popup and "Follow KDE profile" see the
+  right profile on such boards.
+* `ecomode status` reports the board, and `fans.auto_writable`.
 
 ## License
 

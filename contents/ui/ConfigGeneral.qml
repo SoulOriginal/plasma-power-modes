@@ -184,10 +184,12 @@ Kirigami.FormLayout {
         text: "Max holds the performance profile for this session only and " +
               "re-sends it every 30 s so the laptop's controller keeps the " +
               "full power limits. It ends on logout, reboot, or when you pick " +
-              "a power profile by hand, and pauses on battery. The controller " +
-              "hands fans at full speed back to automatic only after about 2 " +
-              "minutes without Max, so leaving full speed takes that long and " +
-              "a switch to Auto or Boost starts with a pause."
+              "a power profile by hand, and pauses on battery. On the OMEN 16 " +
+              "the controller hands fans at full speed back to automatic only " +
+              "after about 2 minutes without Max, so leaving full speed takes " +
+              "that long and a switch to Auto or Boost starts with a pause; on " +
+              "the OMEN 17 (and other boards outside hp-wmi's Victus-S table) " +
+              "automatic is written back at once."
     }
 
     CheckBox {
