@@ -25,9 +25,13 @@ popup says why.
 
 Alongside the modes:
 
-* Battery care stops charging at 60, 70, 80 or 90 % and resumes 5 % lower.
+* Battery care stops charging at 60, 70, 80 or 90 % and resumes 5 % lower,
+  also while the laptop sleeps on AC. An optional log shows every decision,
+  a chart of the last day or week, battery use while asleep and how the
+  battery's capacity changes over the months.
 * The popup can follow the KDE Power Profile slider: Power Save turns on Eco,
-  Balanced goes to Normal, Performance starts Max.
+  Balanced goes to Normal, Performance starts Max. With two-way sync on, Eco
+  and Normal picked in the widget move the slider too.
 * The panel can show CPU watts, plus GPU watts while something uses the GPU
   (`21·19W`).
 * The popup lists CPU limits and what limits the CPU right now (power limit,
@@ -206,6 +210,24 @@ If the service stops at or above the stop level, charging stays held across
 the shutdown. Below it, charging is always set back to normal, so a battery
 can never be left unable to charge.
 
+While the laptop is suspended nothing keeps the window, so a systemd-sleep
+hook holds charging before a suspend on AC at 50 % or more, and the service
+puts the previous mode back on wake. Below 50 %, or on battery, nothing is
+held: a nearly flat battery still charges while asleep, possibly to 100 %.
+Hibernate and shutdown are left alone; a laptop that is off charges to 100 %
+below the stop level. Measured on the 16-wf0: 8 h 45 min asleep on AC at
+80 %, woke at 80 %.
+
+The Battery care log is off by default. With it on, every decision goes to
+the journal with its reason (`journalctl -t ecomode-charge`), and two small
+files feed the popup: `/var/lib/ecomode/charge-history`, one line per change
+of charge, power source or mode, kept 7 days, and
+`/var/lib/ecomode/battery-health`, the capacity the battery's own controller
+estimates, written when the estimate moves and once a day, kept 400 days.
+The popup then shows a chart of the last 24 h or 7 days, the last sleep and
+the average drain asleep on battery, and how much capacity the battery has
+lost since the first record.
+
 The stock kernel does not offer `charge_behaviour` on the HP OMEN 16-wf0,
 although the firmware supports it. [`kernel/hp-wmi-charge`](kernel/hp-wmi-charge)
 adds it to the kernel's own `hp-wmi` driver through DKMS. See its README for
@@ -257,6 +279,15 @@ To remove everything and put every setting back:
 kernel/hp-wmi-charge/uninstall.sh     # if installed
 ```
 
+To update, pull and run the installer again; it restarts the charge service
+when it is running. Then restart Plasma so the panel loads the new widget:
+
+```sh
+git pull
+./install.sh
+systemctl --user restart plasma-plasmashell.service
+```
+
 `./install.sh --dev` links the widget to the checkout instead of copying it,
 so edits show up after `systemctl --user restart plasma-plasmashell.service`.
 
@@ -268,7 +299,11 @@ ecomode status --deep                # plus GPU readings and who holds the GPU
 pkexec ecomode on --level deepest    # gentle, deep or deepest
 pkexec ecomode off
 pkexec ecomode charge on --stop 80   # 50..95
+pkexec ecomode charge on --log on    # with the Battery care log (journal, chart)
 pkexec ecomode charge off
+ecomode charge-history --hours 168   # what the chart shows: 24 or 168 hours
+ecomode set-profile balanced         # move the KDE slider (no root)
+journalctl -t ecomode-charge         # Battery care decisions, with reasons
 pkexec ecomode-max on --fans boost --gpu-boost
 pkexec ecomode-max off
 pkexec ecomode-max fans auto         # fans left at full speed back to automatic
@@ -290,11 +325,24 @@ Add `--json` for machine-readable output.
 ## If the GPU never sleeps
 
 Open the popup and look at the GPU card. "Kept awake by" lists every process
-with an NVIDIA device open. Two that are easy to miss:
+with an NVIDIA device open; while the card is awake anyway the popup also
+asks the driver, so system processes and KWin (whose files a user cannot
+read) are listed too.
+
+The desktop itself holds the driver open all the time: SDDM's Xorg, KWin
+(6.7 opens every GPU it finds) and the Plasma shell. That does not keep the
+card awake, and the popup lists them as such unless a display is connected
+to the NVIDIA card. What does keep it awake is anything that asks the driver
+every few seconds, `nvidia-smi` above all. Three that are easy to miss:
 
 * KDE's GPU sensors. Any widget that shows a GPU value makes `ksystemstats`
   run `nvidia-smi dmon` permanently. Remove that sensor, or use a widget that
   reads it only while the GPU is busy anyway.
+* A sampler that counts the desktop as a holder. Before this was fixed, the
+  watts sampler saw KWin and Xorg on the card, asked it for its draw every
+  3 s and kept it awake itself; the card slept 2 s after the sampler stopped.
+  To check a suspect, stop it for a minute and watch
+  `/sys/bus/pci/devices/<dGPU>/power/runtime_status`.
 * Applications whose toolkit loads NVIDIA's EGL library even though they draw
   on the integrated GPU. For a Flatpak app this keeps it on Mesa:
   `flatpak override --user --env=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/lib/x86_64-linux-gnu/GL/default/share/glvnd/egl_vendor.d/50_mesa.json <app-id>`
@@ -342,6 +390,20 @@ and a minute of CPU load with the watts sampler on, as
   instead of `low-power`, so the popup and "Follow KDE profile" see the
   right profile on such boards.
 * `ecomode status` reports the board, and `fans.auto_writable`.
+* **Battery care while asleep**: a systemd-sleep hook holds charging during a
+  suspend on AC at 50 % or more, and the service restores the mode on wake.
+* **Battery care log** (off by default): decisions with reasons in the
+  journal, a 24 h / 7 day chart, battery use while asleep, and the battery's
+  capacity over time.
+* **Two-way sync with the KDE profile**: Eco and Normal picked in the widget
+  move the slider; leaving Max, the slider moves only after Max has stopped.
+* **Fans left at full speed after Max** (16-wf0): the keeper asks the EC
+  whether it still holds full speed instead of trusting its own record, waits
+  once for it to let go, and the popup says when the fans go back to auto.
+* **The dGPU can sleep with the desktop on it**: Xorg, KWin, Xwayland and the
+  Plasma shell no longer count as holders unless a display is on the card,
+  so the watts sampler and the popup stop polling it awake. The popup lists
+  holders the driver reports, KWin and root processes included.
 
 ## License
 
