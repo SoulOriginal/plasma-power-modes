@@ -8,7 +8,9 @@
        - start and stop Max, which holds the performance profile (as
          power-profiles-daemon already lets that session do), with the fans
          on auto, max (full speed) or boost (full speed while the CPU is
-         hot);
+         hot); stopping also puts fans left at full speed back to
+         automatic, on the boards where hp-wmi lets that be written;
+       - put the fans to automatic or full speed by hand, with Max off;
        - when Max starts over Eco, roll Eco back to the originals Eco
          recorded, through ecomode's own exact restore;
        - start and stop nvidia-powerd (NVIDIA Dynamic Boost) together with

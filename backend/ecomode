@@ -77,9 +77,29 @@ WATTS_FILE = os.path.join(STATE_DIR, "watts")
 # Present while Max has started nvidia-powerd (Dynamic Boost) and owes a stop.
 POWERD_FLAG = os.path.join(STATE_DIR, "powerd-started")
 
-# Boards whose EC drops the user-selected thermal profile 120 s after the
-# last WMI 0x20008/0x10 query. Verified on 8BAB only.
-SUPPORTED_BOARDS = {"8BAB"}
+# Boards Max runs on.
+#  8BAB  OMEN 16-wf0: the EC drops the user-selected thermal profile 120 s
+#        after the last WMI 0x20008/0x10 query, which the keep-alive restarts.
+#  8A17  OMEN 17-ck1xxx (i7-12700H, RTX 3060 Laptop): the same hp-wmi
+#        profiles and fan control. Measured there (docs/8A17-measurements.md):
+#        the EC caps the CPU at 45 W over PECI some 20-40 s into any full
+#        load, in every profile, and no profile write lifts it; RAPL keeps
+#        reading 115 W. Max cannot change that. It keeps the profile, the
+#        fans and Dynamic Boost where they were put, and the keep-alive is
+#        at worst redundant.
+SUPPORTED_BOARDS = {"8BAB", "8A17"}
+# hp-wmi handles the fans in two families, and pwm1_enable=2 ("automatic")
+# means different things in them. These are the boards of the driver's
+# victus_s_thermal_profile_boards table (Linux 7.2): there 2 becomes WMI 0x27
+# {0} and 0x2E {0x00, 0x00}, and the EC on 8BAB takes the latter literally
+# and stops the fans. On every other OMEN (8A17 among them) 2 is 0x27 {0}
+# alone, the plain "max fans off", and it is the only way back: the driver
+# itself re-sends "max fans" every 90 s until that write, so fans left at 0
+# stay at full speed until the next boot. ecomode-max writes 2 on those
+# boards and never on these.
+VICTUS_S_BOARDS = {"8902", "8A44", "8A4D", "8BAB", "8B2F", "8BBE", "8BC2",
+                   "8BCA", "8BCD", "8BD4", "8BD5", "8C76", "8C77", "8C78",
+                   "8C99", "8C9C", "8D26", "8D41", "8D87", "8E35"}
 BOARD_NAME = "/sys/class/dmi/id/board_name"
 PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
 PROFILE_CLASS_GLOB = "/sys/class/platform-profile/platform-profile-*"
@@ -463,15 +483,19 @@ def fans_controllable():
 def fan_info():
     d = find_hp_hwmon()
     if d is None:
-        return {"available": False, "rpm": [], "pwm_enable": None}
+        return {"available": False, "rpm": [], "pwm_enable": None, "auto_writable": False}
     rpm = []
     for path in sorted(globmod.glob(f"{d}/fan*_input")):
         try:
             rpm.append(int(read_path(path)))
         except (TypeError, ValueError):
             pass
-    return {"available": os.path.exists(f"{d}/pwm1_enable"), "rpm": rpm,
-            "pwm_enable": read_path(f"{d}/pwm1_enable")}
+    available = os.path.exists(f"{d}/pwm1_enable")
+    return {"available": available, "rpm": rpm,
+            "pwm_enable": read_path(f"{d}/pwm1_enable"),
+            # Whether pwm1_enable=2 may be written to put the fans back to
+            # the firmware's curve (see VICTUS_S_BOARDS).
+            "auto_writable": available and read_path(BOARD_NAME) not in VICTUS_S_BOARDS}
 
 
 def on_ac():
@@ -1907,10 +1931,12 @@ def sample_power(seconds=POWER_WINDOW_S):
     return round(delta / elapsed / 1_000_000, 2)
 
 
-# power-profiles-daemon's names for the platform_profile values it sets on
-# this machine. Any other value (quiet, cool, custom...) is left for the
-# daemon itself to name.
-PPD_PROFILE_NAMES = {"low-power": "power-saver", "balanced": "balanced",
+# power-profiles-daemon's names for the platform_profile values it sets:
+# power-saver is "low-power" where the firmware offers it, else "cool" or
+# "quiet" (8A17 offers cool/quiet/balanced/performance). Any other value
+# (custom...) is left for the daemon itself to name.
+PPD_PROFILE_NAMES = {"low-power": "power-saver", "quiet": "power-saver",
+                     "cool": "power-saver", "balanced": "balanced",
                      "performance": "performance"}
 
 
@@ -2010,6 +2036,7 @@ def cmd_status(args):
         "pkg_temp_c": pkg_temp_c(),
         "on_ac": on_ac(),
         "battery": battery_info(),
+        "board": read_path(BOARD_NAME),
     })
     emit(result, args)
     return 0

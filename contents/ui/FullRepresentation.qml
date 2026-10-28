@@ -340,12 +340,31 @@ Item {
                     font: Kirigami.Theme.smallFont
                     opacity: 0.7
                     text: full.fansShown === "max"
-                        ? "Full speed. Back to automatic about 2 minutes after Max ends "
-                          + "or you switch."
+                        ? (full.fans.auto_writable === true
+                           ? "Full speed while Max runs; automatic again as soon as Max "
+                             + "ends, pauses or you switch."
+                           : "Full speed. Back to automatic about 2 minutes after Max ends "
+                             + "or you switch.")
                         : full.fansShown === "boost"
-                        ? "Full speed from 85 °C; after 3 minutes below 65 °C, Max pauses "
-                          + "about 2 minutes while the fans hand back to automatic."
+                        ? (full.fans.auto_writable === true
+                           ? "Full speed from 85 °C; automatic again after 3 minutes "
+                             + "below 65 °C."
+                           : "Full speed from 85 °C; after 3 minutes below 65 °C, Max pauses "
+                             + "about 2 minutes while the fans hand back to automatic.")
                         : "The firmware's own fan curve."
+                }
+
+                // 8A17 (OMEN 17-ck1xxx): measured, see docs/8A17-measurements.md.
+                PC3.Label {
+                    visible: st.board === "8A17"
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                    text: "On this laptop the embedded controller caps the CPU at 45 W "
+                          + "after 20 to 40 s of full load, whatever the profile; the GPU "
+                          + "keeps its full limit. Max keeps the profile and the fans where "
+                          + "you put them and cannot lift that cap."
                 }
 
                 Toggle {
@@ -450,7 +469,9 @@ Item {
                     wrap: true
                 }
                 Stat {
-                    visible: root.mode === "max"
+                    // The 120 s fallback is the 16-wf0's; the 17-ck1xxx has a
+                    // cap of its own that no keep-alive holds off (Max card).
+                    visible: root.mode === "max" && st.board !== "8A17"
                     label: "EC 44 W fallback"
                     value: st.max && st.max.state === "active"
                         ? "held off by the keep-alive" : "not held off while paused"

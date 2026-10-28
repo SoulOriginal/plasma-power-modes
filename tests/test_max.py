@@ -56,11 +56,17 @@ def check(label, cond, detail=""):
 
 
 class FakeHw:
-    def __init__(self, profile="balanced", pwm="2", ac=True, temp=None):
+    """can_auto=False is a Victus-S board (8BAB), where pwm1_enable=2 is
+    never written; True is any other OMEN (8A17), where it is the way back
+    to automatic and the EC's word follows every write."""
+
+    def __init__(self, profile="balanced", pwm="2", ac=True, temp=None, can_auto=False):
         self.profile = profile
         self.pwm = pwm            # the firmware's own "2" until something writes
         self.ac = ac
         self.temp = temp          # package °C, or None for no reading
+        self.can_auto = can_auto
+        self.pwm_path = "/sys/class/hwmon/hwmonX/pwm1_enable"
         self.writes = []          # ("profile" | "pwm", value), in order
         self.all_writes = []      # the same, but never cleared by a scenario
         self.fail = set()         # {"profile", "pwm"}: make those writes fail
@@ -84,10 +90,14 @@ class FakeHw:
         self._log(("pwm", value))
         if "pwm" in self.fail:
             return False, "[Errno 22] Invalid argument"
+        if value == "2" and not self.can_auto:
+            return False, "refusing pwm1_enable=2: it stops the fans on this board"
         self.pwm = value
         return True, None
 
     def fans_at_max(self):
+        if self.can_auto:
+            return {"0": True, "2": False}.get(self.pwm)
         return self.ec_max
 
     def on_ac(self):
@@ -775,6 +785,7 @@ ORIG = {
     "_signal_add": mx._signal_add, "time": mx.time, "Keeper": mx.Keeper,
     "uid_state_native": mx.uid_state_native,
     "PLATFORM_PROFILE": eco.PLATFORM_PROFILE, "on_ac": eco.on_ac,
+    "BOARD_NAME": eco.BOARD_NAME,
 }
 
 
@@ -793,7 +804,16 @@ def stub_env(fail_on=None):
     eco.max_support = lambda: (True, None)
     eco.fans_controllable = lambda: True
     eco.pkg_temp_c = lambda: 60
+    # The board the CLI sees: 8BAB, a Victus-S one, as the scenarios were
+    # written; a scenario for another board rewrites the file.
+    fake_board("8BAB")
     return rec
+
+
+def fake_board(name):
+    board = TMP / "board_name"
+    board.write_text(name)
+    eco.BOARD_NAME = str(board)
 
 
 def reset():
@@ -802,7 +822,7 @@ def reset():
                  "Keeper", "uid_state_native"):
         setattr(mx, name, ORIG[name])
     for name in ("max_support", "fans_controllable", "max_state", "find_hp_hwmon",
-                 "pkg_temp_c", "write_path", "PLATFORM_PROFILE", "on_ac"):
+                 "pkg_temp_c", "write_path", "PLATFORM_PROFILE", "on_ac", "BOARD_NAME"):
         setattr(eco, name, ORIG[name])
     mx.watts_active = ORIG["watts_active"]
     eco.RAPL = ORIG["RAPL"]
@@ -1280,6 +1300,22 @@ check("pwm1_enable=2 is refused where sysfs is written",
 ok, _ = sysfs.write_pwm("0")
 check("full speed is written", ok is True and pwm_file.read_text() == "0", pwm_file.read_text())
 check("no hp hwmon: no fan write", mx.SysfsHw(None).write_pwm("0")[0] is False)
+victus = mx.SysfsHw(str(pwm_file.parent), board="8BAB")
+ok, _ = victus.write_pwm("2")
+check("8BAB: pwm1_enable=2 is refused by name too",
+      ok is False and victus.can_auto is False and pwm_file.read_text() == "0")
+other = mx.SysfsHw(str(pwm_file.parent), board="8A17")
+ok, _ = other.write_pwm("2")
+check("8A17: automatic is written, and the EC's word follows",
+      ok is True and other.can_auto is True and pwm_file.read_text() == "2"
+      and other.fans_at_max() is False, pwm_file.read_text())
+check("1 is refused everywhere", other.write_pwm("1")[0] is False)
+check("no hp hwmon: automatic cannot be written either",
+      mx.SysfsHw(None, board="8A17").can_auto is False)
+check("every Victus-S board of hp-wmi keeps the silence rule",
+      all(not mx.SysfsHw("/x", board=b).can_auto for b in mx.VICTUS_S_BOARDS))
+fake_board("8A17")
+check("detect() reads the board", mx.SysfsHw.detect().can_auto is True)
 eco.pkg_temp_c = lambda: 77
 check("the package temperature is read for boost", mx.SysfsHw(None).read_temp() == 77)
 reset()
@@ -2543,6 +2579,183 @@ check("settle: the EC on its curve - the record decides",
       S("auto", rec, 1000, False) == 40 and S("auto", None, 1000, False) == 0)
 check("settle: no reading - the record decides", S("auto", rec, 1000, None) == 40)
 check("settle: a max session never waits", S("max", rec, 1000, True) == 0)
+check("settle: nothing to wait for where automatic can be written",
+      S("auto", rec, 1000, True, can_auto=True) == 0
+      and S("boost", None, 1000, True, can_auto=True) == 0)
+
+# ---------------------------------------------------------------------------
+# 46. boards where automatic can be written (8A17): the fans come back
+# ---------------------------------------------------------------------------
+print("\n\033[1m46. fans back to automatic where that can be written\033[0m")
+# On 8A17 pwm1_enable=2 is the plain "max fans off", and the only way back:
+# hp-wmi re-sends "max fans" every 90 s until it is written. Seen there:
+# fans at full speed until the next boot after a Max session with fans at
+# max. So on these boards the keeper writes 2, and never waits.
+k, hw, ppd, store, clock = make(can_auto=True, settle=125)        # fans max
+k.start(pid=1)
+check("full speed written, no settle despite the record",
+      hw.pwm == "0" and store.state["fans_state"] == "max"
+      and store.state["state"] == "active" and store.state["settle_until"] is None,
+      store.state)
+check("nothing to arm: the EC does not time out here",
+      store.state["fans_armed_until"] is None, store.state)
+hw.writes.clear()
+hw.ac = False
+clock.now = 1030
+k.tick()
+check("battery: the fans go back to automatic",
+      hw.pwm == "2" and pwm_writes(hw) == [("pwm", "2")]
+      and store.state["fans_state"] == "auto", (hw.writes, store.state))
+hw.writes.clear()
+hw.ac = True
+clock.now = 1060
+k.tick()
+check("AC back: full speed again", hw.pwm == "0" and ("pwm", "0") in hw.writes, hw.writes)
+hw.writes.clear()
+store.reason = "off"
+k.on_terminate()
+check("off: automatic written, nothing left to wait for",
+      hw.pwm == "2" and pwm_writes(hw) == [("pwm", "2")]
+      and store.last["fans_armed_until"] is None, (hw.writes, store.last))
+
+k, hw, ppd, store, clock = make(fans="auto", can_auto=True, pwm="0", settle=125)
+alive = k.start(pid=1)
+check("auto over a leftover full speed: handed back in the first round, no settle",
+      alive is True and hw.pwm == "2" and store.state["state"] == "active"
+      and store.state["settle_until"] is None and store.state["fans_state"] == "auto",
+      (hw.pwm, store.state))
+hw.writes.clear()
+k.tick()
+check("... and only once", pwm_writes(hw) == [], hw.writes)
+
+k, hw, ppd, store, clock = make(fans="auto", can_auto=True)
+k.start(pid=1)
+k.tick()
+k.on_terminate()
+check("auto over automatic fans never writes pwm1_enable", pwm_writes(hw) == [], hw.writes)
+
+k, hw, ppd, store, clock = make(fans="boost", can_auto=True)
+k.start(pid=1)
+clock.now = 1005
+poll(k, hw, 90)
+check("boost: hot runs the fans up",
+      hw.pwm == "0" and store.state["fans_state"] == "max", store.state)
+hw.writes.clear()
+hold_temp(k, hw, clock, 60, 1190)
+check("cool for 3 minutes: automatic written at once, no pause",
+      hw.pwm == "2" and ("pwm", "2") in hw.writes and store.state["state"] == "active"
+      and store.state["fans_state"] == "auto" and store.state["settle_until"] is None,
+      (hw.writes, store.state))
+hw.writes.clear()
+hw.ac = False
+clock.now = 1200
+k.tick()
+poll(k, hw, 90)
+check("battery while boost is cool writes no fans, hot or not",
+      pwm_writes(hw) == [], hw.writes)
+
+k, hw, ppd, store, clock = make(fans="boost", can_auto=True)
+k.start(pid=1)
+poll(k, hw, 90)
+hw.ac = False
+clock.now = 1030
+k.tick()
+check("battery while boost is hot: automatic, and boost starts over",
+      hw.pwm == "2" and k.fans_hot is False, (hw.pwm, k.fans_hot))
+hw.ac = True
+hw.writes.clear()
+clock.now = 1060
+k.tick()
+check("AC back: the fans stay automatic until it is hot again",
+      pwm_writes(hw) == [], hw.writes)
+poll(k, hw, 90)
+check("... which runs them up again", hw.pwm == "0", hw.pwm)
+
+k, hw, ppd, store, clock = make(can_auto=True)
+k.start(pid=1)
+hw.fail = {"pwm"}
+store.reason = "off"
+k.on_terminate()
+check("a hand-back that fails on the way out still ends Max",
+      k.running is False and store.last["reason"] == "off", store.last)
+
+k, hw, ppd, store, clock = make(fans="auto", can_auto=True)
+k.start(pid=1)
+hw.pwm = "0"                      # set from outside while Max ran
+hw.writes.clear()
+clock.now = 1030
+k.tick()
+check("full speed set by something else is taken back on the next round",
+      hw.pwm == "2" and pwm_writes(hw) == [("pwm", "2")], hw.writes)
+
+# The CLI on such a board: no settle, off and cleanup put the fans back,
+# and the fans by hand.
+temp_run()
+rec = stub_env()
+fake_board("8A17")
+pwm_file = fake_hwmon("0")
+last_written(ended_at=int(time.time()), reason="off",
+             fans_armed_until=int(time.time()) + 60)
+code, res = capture(mx.cmd_on, cli_args(fans="auto"))
+check("8A17: auto after a session at full speed starts at once",
+      code == 0 and settle_of(started(rec)) == 0, (res, rec.calls))
+reset()
+
+temp_run()
+stub_env()
+fake_board("8A17")
+pwm_file = fake_hwmon("0")
+code, res = capture(mx.cmd_off, cli_args())
+check("8A17: off with nothing running takes leftover fans back",
+      code == 0 and res["noop"] is True and res["fans"] == "automatic"
+      and pwm_file.read_text() == "2", res)
+reset()
+
+temp_run()
+stub_env()
+pwm_file = fake_hwmon("0")
+code, res = capture(mx.cmd_off, cli_args())
+check("8BAB: off leaves the fans to the EC",
+      code == 0 and res["fans"] is None and pwm_file.read_text() == "0", res)
+reset()
+
+temp_run()
+stub_env()
+fake_board("8A17")
+pwm_file = fake_hwmon("0")
+writes, last = crash_cleanup(
+    {"pid": 1, "fans": "max", "fans_state": "max", "state": "active",
+     "fans_armed_until": int(time.time()) + 100})
+check("8A17: cleanup after a crash puts the fans back, nothing to wait for",
+      writes == [(str(pwm_file), "2")] and last.get("fans_armed_until") is None
+      and last.get("reason") == "stopped unexpectedly (signal)", (writes, last))
+reset()
+
+temp_run()
+stub_env()
+fake_board("8A17")
+pwm_file = fake_hwmon("0")
+code, res = capture(mx.cmd_fans, cli_args(mode="auto"))
+check("8A17: fans auto by hand", code == 0 and pwm_file.read_text() == "2"
+      and res["fans"] == "auto" and res["pwm_enable"] == "2", res)
+code, res = capture(mx.cmd_fans, cli_args(mode="max"))
+check("fans max by hand", code == 0 and pwm_file.read_text() == "0", res)
+eco.max_state = lambda: {"pid": 1, "state": "active", "fans": "auto"}
+code, res = capture(mx.cmd_fans, cli_args(mode="auto"))
+check("not while Max runs", code == 1 and pwm_file.read_text() == "0", res)
+reset()
+
+temp_run()
+stub_env()
+pwm_file = fake_hwmon("0")
+code, res = capture(mx.cmd_fans, cli_args(mode="auto"))
+check("8BAB: auto by hand is refused", code == 1 and pwm_file.read_text() == "0", res)
+code, res = capture(mx.cmd_fans, cli_args(mode="max"))
+check("8BAB: max by hand is written", code == 0 and pwm_file.read_text() == "0", res)
+eco.find_hp_hwmon = lambda: None
+code, res = capture(mx.cmd_fans, cli_args(mode="max"))
+check("no hp fan control: refused", code == 1, res)
+reset()
 
 # ---------------------------------------------------------------------------
 print(f"\n\033[1m{PASS} passed, {FAIL} failed\033[0m")

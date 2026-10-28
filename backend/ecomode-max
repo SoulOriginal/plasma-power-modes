@@ -28,6 +28,8 @@ The polkit action io.github.souloriginal.powermodes.max lets the active local se
 this file without a password. That covers everything it does:
 - start and stop Max, with the fans on auto, max (full speed) or boost (full
   speed while the CPU package is hot), and switch between them;
+- put the fans back to automatic or to full speed by hand (`fans`), with
+  Max off;
 - when Max starts over Eco, roll Eco back to the originals it recorded
   (`ecomode off`, whose exact restore this reuses);
 - start and stop nvidia-powerd (NVIDIA Dynamic Boost) along with Max, if it
@@ -80,18 +82,30 @@ HOLD_PROFILE = "performance"
 HOLD_REASON = "Max power mode (EC keep-alive)"
 HOLD_APP_ID = "io.github.souloriginal.powermodes"
 
-# Fans. hp-wmi's pwm1_enable takes 0 (full speed) and 2 ("automatic"), and 2
-# is never written: on 6.18 it becomes WMI 0x10, 0x27 {0} and 0x2E {0x00,
-# 0x00}, and the EC on 8BAB takes 0x2E {0,0} literally and stops the fans.
-# It keeps them stopped for as long as 0x10 keeps arriving - and every
-# platform_profile write sends one, ours every 30 s and the daemon's when a
-# hold is taken or released. Measured: the fans stood still for a whole Max
-# session. So full speed is left only through silence: no hold and no
-# profile write for FAN_RELEASE_SECS, until the EC's 120 s timer runs out and
-# it takes the fans back to its own curve.
-FANS_MAX = "0"             # the only value ever written to pwm1_enable
+# Fans. hp-wmi's pwm1_enable takes 0 (full speed) and 2 ("automatic"). What
+# 2 does depends on the board, since the driver handles two families (see
+# VICTUS_S_BOARDS in ecomode):
+#  * Victus-S boards (8BAB is one): 2 becomes WMI 0x10, 0x27 {0} and 0x2E
+#    {0x00, 0x00}, and the EC on 8BAB takes 0x2E {0,0} literally and stops
+#    the fans. It keeps them stopped for as long as 0x10 keeps arriving - and
+#    every platform_profile write sends one, ours every 30 s and the daemon's
+#    when a hold is taken or released. Measured: the fans stood still for a
+#    whole Max session. On these boards 2 is never written; full speed is
+#    left only through silence: no hold and no profile write for
+#    FAN_RELEASE_SECS, until the EC's 120 s timer runs out and it takes the
+#    fans back to its own curve.
+#  * Every other OMEN (8A17 among them): 2 is 0x27 {0} alone, the plain "max
+#    fans off", and the driver itself re-sends "max fans" every 90 s until
+#    that write. The EC never times out of it, so fans left at 0 stay at
+#    full speed until the next boot (seen on 8A17 after a Max session with
+#    fans at max). Here 2 is written whenever the fans should be automatic
+#    again: when Max ends or pauses, when boost has cooled down, and at the
+#    start when an earlier session left them running.
+FANS_MAX = "0"
+FANS_AUTO = "2"            # written only where SysfsHw.can_auto says so
 FANS_MODES = ("auto", "max", "boost")
-FAN_RELEASE_SECS = 125     # the EC drops user-defined fan state 120 s after the last 0x10
+VICTUS_S_BOARDS = eco.VICTUS_S_BOARDS
+FAN_RELEASE_SECS = 125     # Victus-S: the EC drops user fan state 120 s after the last 0x10
 BOOST_ON_C = 85            # boost: full speed at or above this package temperature
 BOOST_OFF_C = 65           # ...and hands back once it stays at or below this
 BOOST_COOL_SECS = 180      # ...for this long
@@ -108,18 +122,20 @@ WATTS_SANE_MAX = 1000   # W; anything above is a counter glitch, not a reading
 class Keeper:
     """The keep-alive state machine, free of I/O so it can be tested.
 
-    fans   "auto" never touches the fans, "max" runs them at full speed,
-           "boost" does so while the CPU package is hot (on_temp)
+    fans   "auto" leaves the fans to the firmware, "max" runs them at full
+           speed, "boost" does so while the CPU package is hot (on_temp)
     hw     read_profile() -> str|None, write_profile(v) -> (ok, err),
-           write_pwm(v) -> (ok, err), only ever with FANS_MAX,
-           on_ac() -> True|False|None, read_temp() -> °C|None
+           write_pwm(v) -> (ok, err) with FANS_MAX or FANS_AUTO,
+           fans_at_max() -> True|False|None (what the EC says),
+           can_auto: whether FANS_AUTO may be written on this board (see
+           FANS_AUTO), on_ac() -> True|False|None, read_temp() -> °C|None
     ppd    hold(profile, reason, app_id) -> cookie, release(cookie)
     store  save(state), clear(), save_last(entry), stop_reason() -> str|None
     clock  time() -> float
     session alive() -> True|False|None: whether the user who started Max is
            still logged in; None when logind could not say
-    settle seconds to stay silent before the first hold: an earlier session
-           left the fans at full speed and the EC has not taken them back
+    settle Victus-S only: seconds to stay silent before the first hold, while
+           the EC takes back fans an earlier session left at full speed
     """
 
     def __init__(self, fans, hw, ppd, store, clock, session, settle=0):
@@ -129,7 +145,10 @@ class Keeper:
         self.store = store
         self.clock = clock
         self.session = session
-        self.settle = settle
+        # Where automatic can be written there is nothing to wait for: the
+        # first round writes it.
+        self.can_auto = bool(getattr(hw, "can_auto", False))
+        self.settle = 0 if self.can_auto else settle
         self.cookie = None
         self.paused = False
         self.profile_at_pause = None
@@ -177,11 +196,12 @@ class Keeper:
             self._pause("battery")
         elif self.settle_until is not None and self.now() < self.settle_until:
             self._pause("fans settling")
-        elif (self.fans != "max" and not self.fans_hot and not self.resettled
-              and self.hw.fans_at_max() is True):
-            # Full speed this session did not ask for, and every tick of ours
-            # would keep it: be silent for one hand-back. Once only - if the
-            # EC still holds it after that, it is not ours, and Max goes on.
+        elif (not self.can_auto and self.fans != "max" and not self.fans_hot
+              and not self.resettled and self.hw.fans_at_max() is True):
+            # Victus-S: full speed this session did not ask for, and every
+            # tick of ours would keep it: be silent for one hand-back. Once
+            # only - if the EC still holds it after that, it is not ours, and
+            # Max goes on. (Elsewhere _keep_alive simply writes automatic.)
             self.resettled = True
             self.settle_until = self.now() + FAN_RELEASE_SECS
             self._pause("fans settling")
@@ -203,7 +223,10 @@ class Keeper:
         return False
 
     def _save(self):
-        self.state.update(fans_state="max" if self.fans_hot else "auto",
+        # Where automatic can be written a pause hands the fans back (and
+        # resuming runs them up again), so the record follows the EC.
+        hot = self.fans_hot and not (self.can_auto and self.paused)
+        self.state.update(fans_state="max" if hot else "auto",
                           settle_until=self.settle_until,
                           fans_armed_until=self.fans_armed_until)
         self.store.save(self.state)
@@ -215,9 +238,25 @@ class Keeper:
         speed is what the EC says, not only what this session commands: one
         left over from an earlier session is kept there just the same, and
         the record has to say so (seen: every Max toggle after a "max"
-        session kept the fans at full speed two more minutes, unannounced)."""
+        session kept the fans at full speed two more minutes, unannounced).
+        Where automatic can be written the EC does not time out and nothing
+        is armed: the fans are written back instead."""
+        if self.can_auto:
+            return
         if self.fans_hot or self.hw.fans_at_max() is True:
             self.fans_armed_until = self.now() + FAN_RELEASE_SECS
+
+    def _fans_back(self, force=False):
+        """Where automatic can be written: fans the EC holds at full speed
+        while this session does not ask for it (or, with force, whatever it
+        asks: a pause) go back to the firmware's curve. Returns the error,
+        or None."""
+        if not self.can_auto or (self.fans_hot and not force):
+            return None
+        if self.hw.fans_at_max() is not True:
+            return None
+        ok, err = self.hw.write_pwm(FANS_AUTO)
+        return None if ok else f"pwm1_enable: {err}"
 
     def _keep_alive(self):
         if self.paused:
@@ -258,15 +297,28 @@ class Keeper:
             ok, err = self.hw.write_pwm(FANS_MAX)
             if not ok:
                 errors.append(f"pwm1_enable: {err}")
+        else:
+            # Left at full speed by an earlier session, by boost before a
+            # pause, or by anything else: back to the firmware's curve,
+            # where that can be written.
+            err = self._fans_back()
+            if err:
+                errors.append(err)
         self._reached_ec()
         self.state.update(state="active", pause_reason=None,
                           last_tick=self.now(), last_tick_ok=not errors,
                           last_error="; ".join(errors) or None)
 
     def _pause(self, reason):
-        # No fan write here or anywhere on the way out: the only "back to
-        # automatic" there is, pwm1_enable=2, stops the fans (see FANS_MAX).
+        # Victus-S: no fan write here or anywhere on the way out, the only
+        # "back to automatic" there stops the fans (see FANS_AUTO).
         if not self.paused:
+            if self.can_auto:
+                self._fans_back(force=True)
+                if self.fans == "boost":
+                    # Starts over from the temperature once back.
+                    self.fans_hot = False
+                    self.cool_since = None
             self._release()
             self.paused = True
             self.profile_at_pause = self.hw.read_profile()
@@ -321,9 +373,18 @@ class Keeper:
             self._hand_back()
 
     def _hand_back(self):
-        """Boost has cooled down. There is no fan write that means
-        "automatic" (see FANS_MAX), so Max falls silent until the EC takes
-        the fans back, then carries on without them."""
+        """Boost has cooled down: the fans go back to the firmware's curve.
+        On Victus-S there is no fan write that means "automatic" (see
+        FANS_AUTO), so Max falls silent until the EC takes the fans back,
+        then carries on without them."""
+        if self.can_auto:
+            self.fans_hot = False
+            self.cool_since = None
+            err = self._fans_back()
+            if err:
+                self.state.update(last_tick_ok=False, last_error=err)
+            self._save()
+            return
         self._pause("fans settling")      # releasing at full speed: one more 0x10
         self.fans_hot = False
         self.cool_since = None
@@ -356,11 +417,15 @@ class Keeper:
         if not self.running:
             return
         self.running = False
+        if self.can_auto:
+            self.fans_hot = False
+            self._fans_back()             # nothing can end Max twice; errors go unreported
         self._release()
         self.store.clear()
         now, armed = self.now(), self.fans_armed_until
-        # A session that leaves the fans at full speed says until when: the
-        # next one with auto or boost stays silent that long (cmd_on).
+        # Victus-S: a session that leaves the fans at full speed says until
+        # when, and the next one with auto or boost stays silent that long
+        # (cmd_on).
         self.store.save_last({
             "ended_at": now, "reason": reason,
             "fans_armed_until": armed if armed is not None and armed > now else None})
@@ -453,8 +518,17 @@ class FileStore:
 
 
 class SysfsHw:
-    def __init__(self, hwmon_dir):
+    def __init__(self, hwmon_dir, board=None):
         self.pwm_path = f"{hwmon_dir}/pwm1_enable" if hwmon_dir else None
+        # Whether "automatic" may be written here (see FANS_AUTO). A board
+        # that cannot be read is treated as Victus-S: a write that merely
+        # fails to hand the fans back costs less than one that stops them.
+        self.can_auto = (self.pwm_path is not None and board is not None
+                         and board not in VICTUS_S_BOARDS)
+
+    @classmethod
+    def detect(cls):
+        return cls(eco.find_hp_hwmon(), eco.read_path(eco.BOARD_NAME))
 
     def read_profile(self):
         return eco.read_path(eco.PLATFORM_PROFILE)
@@ -463,9 +537,11 @@ class SysfsHw:
         return eco.write_path(eco.PLATFORM_PROFILE, value)
 
     def write_pwm(self, value):
-        # The one place pwm1_enable is written: full speed or nothing, since
-        # 2 stops the fans on this EC (see FANS_MAX).
-        if value != FANS_MAX:
+        # The one place pwm1_enable is written: full speed, or automatic on
+        # the boards where that does not stop the fans (see FANS_AUTO).
+        if value == FANS_AUTO and not self.can_auto:
+            return False, "refusing pwm1_enable=2: it stops the fans on this board"
+        if value not in (FANS_MAX, FANS_AUTO):
             return False, f"refusing pwm1_enable={value}"
         if not self.pwm_path:
             return False, "no hp fan control"
@@ -482,6 +558,16 @@ class SysfsHw:
 
     def read_temp(self):
         return eco.pkg_temp_c()
+
+
+def fans_to_auto(hw):
+    """Fans left at full speed, taken back where that can be written.
+    Returns what the fans are now, for the report, or None when there is
+    nothing to say."""
+    if not hw.can_auto or hw.fans_at_max() is not True:
+        return None
+    ok, err = hw.write_pwm(FANS_AUTO)
+    return "automatic" if ok else f"still at full speed: {err}"
 
 
 def _gio():
@@ -875,11 +961,14 @@ def settle_for(fans, last, now):
     return max(0, min(math.ceil(armed - now), FAN_RELEASE_SECS))
 
 
-def settle_needed(fans, last, now, ec_at_max):
+def settle_needed(fans, last, now, ec_at_max, can_auto=False):
     """settle_for(), checked against the EC itself: the record's remainder
     when it has one; with none, while the EC holds full speed now, an "auto"
     or "boost" session waits a whole hand-back - the record misses what it
-    did not cause."""
+    did not cause. Where automatic can be written there is nothing to wait
+    for: the keeper writes it."""
+    if can_auto:
+        return 0
     settle = settle_for(fans, last, now)
     if settle == 0 and fans != "max" and ec_at_max is True:
         return FAN_RELEASE_SECS
@@ -959,9 +1048,9 @@ def cmd_on(args):
 
     # Read before it goes below: it may say the EC still holds the fans at
     # full speed - also for the session stopped just above.
-    hwmon = eco.find_hp_hwmon()
+    hw = SysfsHw.detect()
     settle = settle_needed(args.fans, eco.read_json(eco.MAX_LAST_FILE), time.time(),
-                           SysfsHw(hwmon).fans_at_max() if hwmon else None)
+                           hw.fans_at_max() if hw.pwm_path else None, hw.can_auto)
     FileStore().clear()
     eco.make_state_dir()
     sh(["systemctl", "reset-failed", UNIT])
@@ -994,9 +1083,13 @@ def cmd_on(args):
 
 @locked
 def cmd_off(args):
+    """Max stopped, and - where automatic can be written - fans left at full
+    speed taken back, also when Max was not on: Normal is what puts the
+    machine right after a crash or an older version."""
     if eco.max_state() is None and not unit_active():
         stop_powerd()             # left behind by a Max that ended as it started
-        eco.emit({"ok": True, "noop": True, "msg": "max is already off"}, args)
+        eco.emit({"ok": True, "noop": True, "msg": "max is already off",
+                  "fans": fans_to_auto(SysfsHw.detect())}, args)
         return 0
     stop_unit("off")
     if unit_active():
@@ -1006,7 +1099,25 @@ def cmd_off(args):
     # keeper died without cleaning up, and a live pid in it is someone else's.
     FileStore().clear()
     stop_powerd()                 # cleanup did it already, unless it failed
-    eco.emit({"ok": True, "msg": "stopped"}, args)
+    eco.emit({"ok": True, "msg": "stopped", "fans": fans_to_auto(SysfsHw.detect())}, args)
+    return 0
+
+
+@locked
+def cmd_fans(args):
+    """The fans by hand, outside Max: automatic (the usual want: a leftover
+    full speed) or full speed. Max's own keeper is left alone: it would
+    write its own choice back within a round anyway."""
+    if eco.max_state() is not None:
+        return fail(args, "max is on; pick the fans in the widget or stop it first")
+    hw = SysfsHw.detect()
+    if hw.pwm_path is None:
+        return fail(args, "no hp fan control (hwmon 'hp' with pwm1_enable)")
+    ok, err = hw.write_pwm(FANS_AUTO if args.mode == "auto" else FANS_MAX)
+    if not ok:
+        return fail(args, f"pwm1_enable: {err}")
+    eco.emit({"ok": True, "fans": args.mode,
+              "pwm_enable": eco.read_path(hw.pwm_path)}, args)
     return 0
 
 
@@ -1105,7 +1216,7 @@ def cmd_run(args):
 
     Gio, GLib = _gio()
     bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-    hw = SysfsHw(hwmon)
+    hw = SysfsHw(hwmon, eco.read_path(eco.BOARD_NAME))
     keeper = Keeper(args.fans, hw, DbusPpd(bus), FileStore(), time,
                     LogindSession(bus, args.uid), settle=args.settle)
     loop = GLib.MainLoop()
@@ -1152,14 +1263,20 @@ def cmd_cleanup(args):
     if state is not None:
         # The keeper did not get to clean up after itself: it crashed or was
         # killed. The daemon already dropped the hold along with the D-Bus
-        # connection. The fans are left alone - the only "automatic" to
-        # write would stop them (see FANS_MAX); the record says how long the
-        # EC may still hold them at full speed, and the next session waits.
+        # connection. The fans go back to automatic where that can be
+        # written; on Victus-S they are left alone - the only "automatic"
+        # there would stop them (see FANS_AUTO) - and the record says how
+        # long the EC may still hold them at full speed, so that the next
+        # session waits.
         now = int(time.time())
         result = os.environ.get("SERVICE_RESULT", "unknown")
+        hw = SysfsHw.detect()
+        if hw.can_auto:
+            fans_to_auto(hw)
         FileStore().save_last({"ended_at": now,
                                "reason": f"stopped unexpectedly ({result})",
-                               "fans_armed_until": crash_armed_until(state, now)})
+                               "fans_armed_until": None if hw.can_auto
+                               else crash_armed_until(state, now)})
     FileStore().clear()
     # However Max ended - off, restart, a picked profile, logout, a crash -
     # Dynamic Boost it started goes with it.
@@ -1268,7 +1385,14 @@ def build_parser():
                       help="also run nvidia-powerd (Dynamic Boost) while Max is on")
     p_on.set_defaults(func=cmd_on)
 
-    sub.add_parser("off", help="stop Max").set_defaults(func=cmd_off)
+    sub.add_parser("off", help="stop Max (and put fans left at full speed back "
+                   "to automatic, where that can be written)").set_defaults(func=cmd_off)
+
+    p_fans = sub.add_parser("fans", help="the fans by hand while Max is off")
+    p_fans.add_argument("mode", choices=["auto", "max"],
+                        help="auto: the firmware's curve (not on Victus-S boards, "
+                             "where the EC takes them back by itself); max: full speed")
+    p_fans.set_defaults(func=cmd_fans)
 
     p_run = sub.add_parser("run", help="internal: the keep-alive, started by systemd")
     p_run.add_argument("--uid", type=user_id, required=True,
