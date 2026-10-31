@@ -464,4 +464,73 @@ t("drain: weighted by time over the sleeps on battery", () =>
         "3.4 %/h over 2 sleeps on battery"))
 t("sleeps: no history", () => assert.equal(m.lastSleepText(null), ""))
 
+// ── the settings' power limits ──
+t("eco on carries the settings' limits, in range only", () => {
+    assert.deepEqual(m.commandsFor("normal", "eco", { ...o, pl1: 30, pl2: 40, tau: 28 }),
+                     [ECO_ON + " --pl1 30 --pl2 40 --tau 28"])
+    assert.deepEqual(m.commandsFor("normal", "eco", { ...o, pl1: 0, pl2: 0, tau: 0 }), [ECO_ON])
+    assert.deepEqual(m.commandsFor("normal", "eco", { ...o, pl1: 300, pl2: 3, tau: 500 }), [ECO_ON])
+    assert.deepEqual(m.commandsFor("normal", "eco", { ...o, pl1: "30; reboot", tau: 28 }),
+                     [ECO_ON + " --tau 28"])
+    // a burst limit under the sustained one would be refused by the helper
+    assert.deepEqual(m.commandsFor("normal", "eco", { ...o, pl1: 40, pl2: 30 }),
+                     [ECO_ON + " --pl1 40"])
+})
+t("eco -> eco with the limits already applied asks for nothing; changed ones re-apply", () => {
+    const running = { mode: "eco", level: "gentle", max_pct: 40, limits: { pl1: 30, tau: 28 } }
+    assert.deepEqual(m.commandsFor("eco", "eco", { ...o, pl1: 30, tau: 28, status: running }), [])
+    assert.deepEqual(m.commandsFor("eco", "eco", { ...o, pl1: 30, tau: 30, status: running }),
+                     [ECO_ON + " --pl1 30 --tau 30"])
+    // the settings cleared while Eco runs with limits: re-apply the level's own
+    assert.deepEqual(m.commandsFor("eco", "eco", { ...o, status: running }), [ECO_ON])
+    // no limits anywhere: applied as asked
+    assert.deepEqual(m.commandsFor("eco", "eco", { ...o, status: { ...running, limits: {} } }), [])
+    assert.deepEqual(m.commandsFor("eco", "eco", { ...o, pl1: 30, status: { ...running, limits: {} } }),
+                     [ECO_ON + " --pl1 30"])
+    assert.equal(m.sameLimits({ pl1: 30 }, { pl1: 30, pl2: undefined }), true)
+    assert.equal(m.sameLimits({ pl1: 30, pl2: null }, { pl1: 30 }), true)
+    assert.equal(m.limitsText({ pl1: 30, pl2: 40, tau: 28 }), "PL1 30 W · PL2 40 W · Tau 28 s")
+    assert.equal(m.limitsText({}), "")
+    assert.equal(m.knobValue({ knobs: [{ id: "rapl_tau", current_human: "28 s" }] }, "rapl_tau"), "28 s")
+    assert.equal(m.knobValue({}, "rapl_tau"), "")
+})
+// ── the dGPU through LACT ──
+t("max on selects the LACT profile, quoted for the shell", () => {
+    assert.deepEqual(m.commandsFor("normal", "max", { ...o, gpuProfile: "Over clock" }),
+                     [MAX_ON + " --gpu-profile 'Over clock'"])
+    assert.deepEqual(m.commandsFor("normal", "max", { ...o, gpuProfile: "default", gpuBoost: true }),
+                     [MAX_ON + " --gpu-boost --gpu-profile 'default'"])
+    assert.deepEqual(m.commandsFor("normal", "max", { ...o, gpuProfile: "" }), [MAX_ON])
+    assert.deepEqual(m.commandsFor("normal", "max", { ...o, gpuProfile: "x'; reboot #" }),
+                     [MAX_ON + " --gpu-profile 'x'\\''; reboot #'"])
+    assert.equal(m.shellQuote("a b"), "'a b'")
+})
+t("GPU clocks card lines", () => {
+    const lact = { available: true, profiles: ["Overclock", "Quiet"], current: "Overclock",
+                   auto_switch: false,
+                   clocks: { core: { current: 100, min: -1000, max: 1000 },
+                             mem: { current: 180, min: -2000, max: 6000 } } }
+    assert.equal(m.lactSummary(lact), "profile Overclock · core +100 MHz · memory +180 MHz")
+    assert.equal(m.lactSummary({ ...lact, current: null, auto_switch: true, clocks: null }),
+                 "profile default (auto)")
+    assert.equal(m.lactSummary({ available: false, error: "lactd: Connection refused" }),
+                 "lactd: Connection refused")
+    assert.equal(m.lactSummary(null), "")
+    assert.equal(m.offsetText(-50), "−50 MHz")
+    assert.equal(m.offsetText(0), "0 MHz")
+    assert.equal(m.offsetText(null), "")
+    assert.equal(m.lactProfileName(null), "default")
+    assert.deepEqual(m.gpuProfileChoices(lact),
+                     [{ id: "", text: "Leave as is" }, { id: "default", text: "LACT default" },
+                      { id: "Overclock", text: "Overclock" }, { id: "Quiet", text: "Quiet" }])
+    assert.equal(m.lactClocksNote(lact, { runtime_status: "active" }), "")
+    assert.equal(m.lactClocksNote({ ...lact, clocks: null }, { runtime_status: "suspended" }),
+                 "The offsets are read while the GPU is awake; it is asleep now.")
+    assert.equal(m.lactClocksNote({ ...lact, clocks: { error: "lactd: x" } }, {}), "lactd: x")
+    assert.equal(m.gpuLimitText({ limit_w: 115, max_limit_w: 140 }),
+                 "115 W, set by the vBIOS · Dynamic Boost to 140 W")
+    assert.equal(m.gpuLimitText({ limit_w: 115, max_limit_w: 115 }), "115 W, set by the vBIOS")
+    assert.equal(m.gpuLimitText({ power_w: 19 }), "")
+})
+
 console.log(`\n${passed} passed`)

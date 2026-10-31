@@ -114,6 +114,65 @@ small root unit reads two sysfs files every 5 s and applies the lock once the
 card is awake, and again after every time it slept, since the driver may drop
 the lock when the card powers down.
 
+#### Your own power limits
+
+The settings take PL1, PL2 and the PL1 window (Tau) by hand, over the
+level's own (`ecomode on --pl1 30 --pl2 40 --tau 28`; 0 in the settings
+means the level's value). A burst limit set this way applies at Gentle too,
+and the window, how long the CPU may run above PL1 before the sustained
+limit binds, is touched only when set. They are RAPL knobs like the level's
+own: recorded before the write, restored exactly by Normal, verified by the
+self-test (the window with a tolerance, since the hardware holds it as
+`2^Y × (1 + Z/4)` time units and 28 s reads back as 27.98 s), and put back
+when the firmware rewrites them. The helper takes 5..250 W and 1..120 s and
+refuses a burst limit under the sustained one. An Eco that is on takes a
+changed setting at once, in the one call that reverts the old values first.
+
+Intel's RAPL has no PL0: the kernel exposes PL1 (`long_term`), PL2
+(`short_term`) and PL4 (`peak_power`, not written). Raising the limits
+above the firmware's defaults buys nothing where the embedded controller
+caps the CPU on its own, as the 8A17 does at 45 W over PECI (next sections):
+the lever is downward.
+
+#### GPU clock offsets through LACT
+
+The other direction for the GPU. The power limit cannot be raised (the
+vBIOS holds it; `nvidia-powerd` lifts it with Dynamic Boost, see Max), but
+the driver takes **clock offsets** over NVML on Wayland, without X11 or
+CoolBits: on an RTX 3060 Laptop (driver 595) the core from −1000 to
++1000 MHz, the memory from −2000 to +6000 MHz.
+[LACT](https://github.com/ilya-zlobintsev/LACT) (`lactd`) does exactly that
+where it is installed: it keeps the offsets in named profiles, applies them
+at boot and again after the card slept, and answers JSON on
+`/run/lactd.sock`, which the `wheel` group may use. The widget does not
+drive NVML itself, which would fight LACT over the same registers; it asks
+LACT, without root or a password, and hides all of this where lactd does
+not answer:
+
+* **The GPU clocks card** names the profile in force and lets you pick
+  another, LACT's own ("default") included. With the popup open and the
+  card awake it also reads the P0 offsets in effect and lets you set them:
+  **Apply** writes them into the profile in force and applies them at once;
+  LACT then waits for **Keep**, and puts the previous offsets back by
+  itself when it does not come within the time it names (the popup counts
+  down, with **Revert** to do it sooner). So a value that hangs the GPU is
+  gone at the next boot. The offsets are asked of the driver like
+  `nvidia-smi` is: with `--deep` only, and only while the card is awake
+  anyway.
+* **Max** can select a LACT profile for the GPU ("GPU profile in Max" in
+  the settings, the row under Dynamic Boost in the Max card): an overclock
+  you defined in LACT, taken when Max starts, with the profile in force and
+  its auto-switch recorded in `/run/ecomode/gpu-profile.json`, and put
+  back when Max ends: by Normal, by the unit's `ExecStopPost` after a
+  logout or a crash, and by a start that failed. A name LACT does not list
+  refuses Max. The switch happens in `ecomode-max` without restarting its
+  keeper, so changing the choice while Max runs costs one call.
+
+Clock offsets apply to every P-state at once, and an unstable one hangs
+the card: raise in small steps and test under load. The Eco clock caps
+above and the offsets are independent: a cap bounds the clock the offset
+shifts.
+
 ### Max on the HP OMEN 16-wf0
 
 ```mermaid
@@ -297,7 +356,14 @@ so edits show up after `systemctl --user restart plasma-plasmashell.service`.
 ecomode status                       # state, limits, GPU, battery
 ecomode status --deep                # plus GPU readings and who holds the GPU
 pkexec ecomode on --level deepest    # gentle, deep or deepest
+pkexec ecomode on --pl1 30 --pl2 40 --tau 28   # your own limits over the level's (W, W, s)
 pkexec ecomode off
+ecomode gpu status                   # LACT's profiles and the one in force (no root)
+ecomode gpu status --clocks          # plus the GPU's clock offsets (wakes a sleeping card)
+ecomode gpu profile 'Quiet'          # select a LACT profile; 'default' for LACT's own
+ecomode gpu offset --core 100 --mem 180   # apply offsets; LACT reverts unless kept
+ecomode gpu keep                     # keep them (LACT saves the profile)
+ecomode gpu revert                   # the previous offsets back now
 pkexec ecomode charge on --stop 80   # 50..95
 pkexec ecomode charge on --log on    # with the Battery care log (journal, chart)
 pkexec ecomode charge off
@@ -305,7 +371,8 @@ ecomode charge-history --hours 168   # what the chart shows: 24 or 168 hours
 ecomode set-profile balanced         # move the KDE slider (no root)
 journalctl -t ecomode-charge         # Battery care decisions, with reasons
 pkexec ecomode-max on --fans boost --gpu-boost
-pkexec ecomode-max off
+pkexec ecomode-max on --gpu-profile 'Overclock'   # plus a LACT profile for the GPU
+pkexec ecomode-max off               # also puts the GPU's LACT profile back
 pkexec ecomode-max fans auto         # fans left at full speed back to automatic
                                      # (OMEN 17 and other non-Victus-S boards)
 ```
@@ -320,6 +387,8 @@ Add `--json` for machine-readable output.
 | Eco CPU limits | Knobs the machine lacks are skipped. |
 | GPU clock caps | Only on an NVIDIA card (found by PCI vendor and class) on NVIDIA's driver. With nouveau or no NVIDIA card, Eco changes the CPU only. |
 | "Limited by" | Intel only; the register means something else on AMD. |
+| Your own power limits | RAPL knobs the machine lacks are skipped, like the levels' own. |
+| GPU clock offsets | Only with [LACT](https://github.com/ilya-zlobintsev/LACT) running and its socket readable (group `wheel`); the card and the Max row are hidden otherwise. |
 | Battery care | Greyed out where the battery driver offers no `charge_behaviour`. |
 
 ## If the GPU never sleeps
@@ -350,15 +419,16 @@ every few seconds, `nvidia-smi` above all. Three that are easy to miss:
 ## Tests
 
 ```sh
-python3 tests/test_ecomode.py    # Eco, GPU caps, Battery care, portability
-python3 tests/test_max.py        # Max keep-alive, fans, watts sampler
+python3 tests/test_ecomode.py    # Eco, the settings' limits, GPU caps, LACT, Battery care, portability
+python3 tests/test_max.py        # Max keep-alive, fans, watts sampler, the GPU's LACT profile
 node tests/test_modes.mjs        # the widget's logic
 ```
 
-They run against a fake sysfs and a fake command runner, without root, and
-never touch the real machine. They include machines without an NVIDIA GPU,
-with nouveau, without a battery, with a battery that offers no charge
-control, and with a CPU that is not Intel.
+They run against a fake sysfs, a fake command runner and a fake lactd on a
+socket of their own, without root, and never touch the real machine. They
+include machines without an NVIDIA GPU, with nouveau, without LACT, without
+a battery, with a battery that offers no charge control, and with a CPU that
+is not Intel.
 
 ## Contributing
 
@@ -376,6 +446,14 @@ and a minute of CPU load with the watts sampler on, as
 
 ### Unreleased
 
+* **Your own power limits**: PL1, PL2 and the PL1 window (Tau) from the
+  settings, over the level's own, recorded, restored and verified like
+  them; a burst limit at Gentle too.
+* **GPU clock offsets through LACT**: a GPU clocks card with the LACT
+  profile in force, the core and memory offsets with Apply / Keep / Revert
+  (LACT's own confirm-or-revert), the vBIOS power limit; Max can select a
+  LACT profile for the GPU and puts the previous one back when it ends.
+  `ecomode gpu ...` on the command line, no root.
 * **HP OMEN 17-ck1xxx (board 8A17)**: Max is available, measured
   (`docs/8A17-measurements.md`), with the popup saying what it can and
   cannot do there.

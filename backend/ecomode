@@ -26,6 +26,7 @@ import glob as globmod
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -161,6 +162,25 @@ KNOBS = [
         "ppd_owned": False,
     },
     {
+        "id": "rapl_tau",
+        "label": "PL1 window (Tau)",
+        "kind": "file",
+        "path": f"{RAPL}/constraint_0_time_window_us",
+        # No level sets it: only a value from the settings (--tau) does.
+        "eco": {},
+        "scale": 1_000_000,
+        "unit": " s",
+        # The hardware holds the window as 2^Y * (1 + Z/4) time units, so
+        # the kernel keeps the nearest value it can (28 s reads back as
+        # 27.98 s): close counts, and the value read back is what Eco owns.
+        "compare": "rounded",
+        "desc": "How long the CPU may run above PL1 before the sustained "
+                "limit binds. The firmware rounds it to what the hardware "
+                "can hold.",
+        "risk": "low",
+        "ppd_owned": False,
+    },
+    {
         "id": "max_pct",
         "label": "CPU ceiling",
         "kind": "file",
@@ -242,6 +262,58 @@ LEVELS = ["gentle", "deep", "deepest"]
 # back as something Eco never wrote.
 MAX_PCT_RANGE = (20, 100)
 
+# The power limits from the settings, over the levels' own: `on --pl1 30
+# --pl2 40 --tau 28`. A limit given this way puts its knob into any level
+# (PL2 at gentle, the window anywhere) and replaces the level's value. They
+# are kept in the state as "limits", knob id -> value in the file's units,
+# so that repair, restore and self-test see the targets the apply used.
+# Raising them above the firmware's defaults buys nothing where the embedded
+# controller caps the CPU on its own (8A17: 45 W over PECI whatever RAPL
+# says), hence the modest top.
+LIMIT_ARGS = {"pl1": "rapl_pl1", "pl2": "rapl_pl2", "tau": "rapl_tau"}
+PL_RANGE_W = (5, 250)
+TAU_RANGE_S = (1, 120)
+
+
+def limits_from_args(args):
+    """The --pl1/--pl2/--tau of a command, as knob id -> sysfs value."""
+    out = {}
+    for arg, knob_id in LIMIT_ARGS.items():
+        value = getattr(args, arg, None)
+        if value is not None:
+            out[knob_id] = str(int(round(float(value) * 1_000_000)))
+    return out
+
+
+def limits_public(limits):
+    """The same, as the widget reads them: {"pl1": 30, "pl2": 40, "tau": 28}."""
+    out = {}
+    for arg, knob_id in LIMIT_ARGS.items():
+        raw = (limits or {}).get(knob_id)
+        if raw is not None:
+            try:
+                out[arg] = int(raw) / 1_000_000
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def check_limits(args):
+    """Why the --pl1/--pl2/--tau of `args` cannot be taken, or None."""
+    lo, hi = PL_RANGE_W
+    for arg in ("pl1", "pl2"):
+        value = getattr(args, arg, None)
+        if value is not None and not lo <= value <= hi:
+            return f"--{arg} must be {lo}..{hi} W"
+    tlo, thi = TAU_RANGE_S
+    tau = getattr(args, "tau", None)
+    if tau is not None and not tlo <= tau <= thi:
+        return f"--tau must be {tlo}..{thi} s"
+    pl1, pl2 = getattr(args, "pl1", None), getattr(args, "pl2", None)
+    if pl1 is not None and pl2 is not None and pl2 < pl1:
+        return "--pl2 must not be below --pl1"
+    return None
+
 # Deliberately NOT included, after verifying each on this machine:
 #   no_turbo            - base clock is 2200/5200 = 42% of max turbo, so
 #                         max_perf_pct <= 42 already subsumes it. Saves ~0 at
@@ -303,12 +375,16 @@ def read_knob(knob):
     return "mixed"
 
 
-def eco_value(knob, max_pct, level=None):
+def eco_value(knob, max_pct, level=None, limits=None):
     """Target value for this knob, or None if it does not apply here.
 
     `eco` may be a plain value, a "{max_pct}" template, or a per-level dict
-    for knobs whose target differs between gentle and deep.
+    for knobs whose target differs between gentle and deep. A limit from
+    the settings (`limits`, see LIMIT_ARGS) wins over all of those.
     """
+    override = (limits or {}).get(knob["id"])
+    if override is not None:
+        return str(override)
     eco = knob.get("eco")
     if eco is None:
         return None
@@ -339,18 +415,26 @@ def available(knob):
     return bool(expand(knob))
 
 
-def in_level(knob, level):
+def in_level(knob, level, limits=None):
+    if knob["id"] in (limits or {}):
+        return True
     eco = knob.get("eco")
     if isinstance(eco, dict):
         return level in eco
     return level in knob.get("levels", LEVELS)
 
 
-def actionable(knob, level=None):
+def actionable(knob, level=None, limits=None):
     """Knobs we are allowed to write at this level."""
     if knob["ppd_owned"] or knob.get("eco") is None or not available(knob):
         return False
-    return True if level is None else in_level(knob, level)
+    return True if level is None else in_level(knob, level, limits)
+
+
+def state_limits(state):
+    """The settings' limits recorded in a state, {} for an older one."""
+    limits = (state or {}).get("limits")
+    return limits if isinstance(limits, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -1978,6 +2062,258 @@ def cpu_avg_mhz():
 
 
 # ---------------------------------------------------------------------------
+# The NVIDIA GPU's clock offsets, through LACT
+# ---------------------------------------------------------------------------
+# The vBIOS owns the power limit on these laptops (`nvidia-smi -pl` is
+# refused; nvidia-powerd lifts it with Dynamic Boost), but the driver takes
+# clock offsets over NVML without X11 or CoolBits - measured on an RTX 3060
+# Laptop (driver 595): the core from -1000 to +1000 MHz, the memory from
+# -2000 to +6000 MHz. LACT (lactd) does exactly that where it is installed:
+# it keeps the offsets in named profiles, applies them at boot and again
+# after the card slept, and answers JSON on a Unix socket the wheel group
+# may use. So the widget does not drive NVML itself, which would fight LACT
+# over the same registers: it asks LACT. The write path is LACT's own: the
+# offsets apply at once and LACT puts the previous ones back by itself
+# unless they are confirmed within the seconds it names (an unstable value
+# that hangs the GPU is thereby gone at the next boot). Without lactd every
+# call here says so and the widget hides the section.
+LACT_SOCKET = "/run/lactd.sock"
+LACT_TIMEOUT_S = 5
+LACT_DEFAULT = "default"       # the CLI's name for LACT's own (unnamed) profile
+# Published by ecomode-max: the LACT profile before Max selected its own.
+GPU_PROFILE_FILE = os.path.join(STATE_DIR, "gpu-profile.json")
+
+
+def lact_call(command, args=None):
+    """(data, error): one request to lactd. `error` is a short string when
+    the daemon is not there, refused the request or answered nonsense."""
+    req = {"command": command}
+    if args is not None:
+        req["args"] = args
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(LACT_TIMEOUT_S)
+            sock.connect(LACT_SOCKET)
+            sock.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as exc:
+        return None, "lactd: " + (exc.strerror or str(exc))
+    try:
+        res = json.loads(buf.decode())
+    except ValueError:
+        return None, "lactd: unreadable answer"
+    if not isinstance(res, dict) or res.get("status") != "ok":
+        data = res.get("data") if isinstance(res, dict) else None
+        why = data.get("description") if isinstance(data, dict) else None
+        src = (data.get("source") or {}).get("description") if isinstance(data, dict) else None
+        return None, "lactd: " + (why or "error") + (f": {src}" if src else "")
+    return res.get("data"), None
+
+
+def lact_available():
+    """(ok, why not): whether lactd listens and this user may talk to it."""
+    if not os.path.exists(LACT_SOCKET):
+        return False, "LACT is not installed or lactd is not running"
+    if not os.access(LACT_SOCKET, os.R_OK | os.W_OK):
+        return False, "no access to the LACT socket (it is the wheel group's)"
+    return True, None
+
+
+def lact_profiles():
+    """(names, current, auto_switch, error); the first three None on error."""
+    data, err = lact_call("list_profiles", {"include_state": False})
+    if err:
+        return None, None, None, err
+    data = data or {}
+    return (sorted(data.get("profiles") or {}), data.get("current_profile"),
+            bool(data.get("auto_switch")), None)
+
+
+def lact_device():
+    """LACT's id and name of the NVIDIA card, or (None, None)."""
+    devs, _ = lact_call("list_devices")
+    for dev in devs or []:
+        if str(dev.get("id", "")).upper().startswith("10DE:"):
+            return dev.get("id"), dev.get("name")
+    return None, None
+
+
+def lact_offset(entry):
+    """One P-state's offset table entry as {current, min, max}, or None."""
+    if not isinstance(entry, dict):
+        return None
+    # P0 is the one LACT's own window edits; any first state otherwise.
+    row = entry.get("0") or (next(iter(entry.values())) if entry else None)
+    if not isinstance(row, dict):
+        return None
+    return {k: row.get(k) for k in ("current", "min", "max")}
+
+
+def lact_clocks(dev_id):
+    """The offsets in force for `dev_id`, with their ranges; asks the driver."""
+    data, err = lact_call("device_clocks_info", {"id": dev_id})
+    if err:
+        return {"error": err}
+    table = (data or {}).get("table") or {}
+    if table.get("type") != "nvidia":
+        return {"error": "LACT has no NVIDIA clock table for this card"}
+    value = table.get("value") or {}
+    return {"core": lact_offset(value.get("gpu_offsets")),
+            "mem": lact_offset(value.get("mem_offsets")),
+            "core_range": value.get("gpu_clock_range"),
+            "mem_range": value.get("vram_clock_range"),
+            "core_locked": value.get("gpu_locked_clocks"),
+            "mem_locked": value.get("vram_locked_clocks"),
+            "error": None}
+
+
+def lact_info(clocks=False):
+    """What LACT holds for the dGPU: its profiles and the one in force, and
+    with `clocks` the offsets in effect (that goes to the driver)."""
+    ok, why = lact_available()
+    info = {"available": ok, "error": why, "profiles": [], "current": None,
+            "auto_switch": None, "device": None, "clocks": None,
+            "max_record": read_json(GPU_PROFILE_FILE)}
+    if not ok:
+        return info
+    names, current, auto, err = lact_profiles()
+    if err:
+        info.update(available=False, error=err)
+        return info
+    info.update(profiles=names, current=current, auto_switch=auto)
+    dev_id, dev_name = lact_device()
+    if dev_id:
+        info["device"] = {"id": dev_id, "name": dev_name}
+        if clocks:
+            info["clocks"] = lact_clocks(dev_id)
+    return info
+
+
+def lact_set_profile(name):
+    """Select a LACT profile by name (LACT_DEFAULT: its own), auto-switch
+    off. Returns (ok, err, changed)."""
+    want = None if name in (LACT_DEFAULT, "", None) else name
+    names, current, auto, err = lact_profiles()
+    if err:
+        return False, err, False
+    if want is not None and want not in names:
+        return False, f"LACT has no profile named {want!r}", False
+    if current == want and not auto:
+        return True, None, False
+    _, err = lact_call("set_profile", {"name": want, "auto_switch": False})
+    return err is None, err, err is None
+
+
+def lact_set_offsets(dev_id, clocks, core=None, mem=None):
+    """Write the P0 clock offsets into the LACT profile in force and apply
+    them. Returns (seconds LACT waits for `keep`, err)."""
+    cmds = []
+    for value, key, name in ((core, "core", "gpu_clock_offset"),
+                             (mem, "mem", "mem_clock_offset")):
+        if value is None:
+            continue
+        rng = (clocks or {}).get(key) or {}
+        lo, hi = rng.get("min"), rng.get("max")
+        if lo is None or hi is None:
+            return None, f"LACT reports no {key} offset range for this card"
+        if not lo <= value <= hi:
+            return None, f"{key} offset must be {lo}..{hi} MHz"
+        cmds.append({"type": {name: 0}, "value": int(value)})
+    if not cmds:
+        return None, "nothing to set: give --core and/or --mem"
+    data, err = lact_call("batch_set_clocks_value", {"id": dev_id, "commands": cmds})
+    if err:
+        return None, err
+    return data, None
+
+
+def lact_confirm(keep):
+    """LACT's pending change kept, or put back. Returns (ok, err)."""
+    _, err = lact_call("confirm_pending_config",
+                       {"command": "confirm" if keep else "revert"})
+    return err is None, err
+
+
+def write_json(path, data):
+    """A world-readable file under STATE_DIR, written whole."""
+    make_state_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def gpu_profile_take(name):
+    """Max: the LACT profile `name` selected, the one in force remembered
+    so that the end of Max puts it back. Returns (ok, err)."""
+    rec = read_json(GPU_PROFILE_FILE)
+    if rec is None:
+        names, current, auto, err = lact_profiles()
+        if err:
+            return False, err
+        rec = {"prior": current, "prior_auto": auto}
+    ok, err, _ = lact_set_profile(name)
+    if not ok:
+        return False, err
+    rec["want"] = name
+    write_json(GPU_PROFILE_FILE, rec)
+    return True, None
+
+
+def gpu_profile_give_back():
+    """The LACT profile as it was before Max took one. Returns (ok, err,
+    restored): ok with nothing to do when Max took none."""
+    rec = read_json(GPU_PROFILE_FILE)
+    if rec is None:
+        return True, None, False
+    _, err = lact_call("set_profile", {"name": rec.get("prior"),
+                                       "auto_switch": bool(rec.get("prior_auto"))})
+    if err:
+        return False, err, False
+    for path in (GPU_PROFILE_FILE, GPU_PROFILE_FILE + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return True, None, True
+
+
+def cmd_gpu(args):
+    """`gpu status|profile|offset|keep|revert`: the dGPU through LACT."""
+    sub = getattr(args, "gpu_cmd", None) or "status"
+    if sub == "status":
+        info = lact_info(clocks=getattr(args, "clocks", False))
+        emit(info, args)
+        return 0 if info["available"] else 1
+    ok, why = lact_available()
+    if not ok:
+        emit({"ok": False, "reason": why}, args)
+        return 1
+    if sub == "profile":
+        ok, err, changed = lact_set_profile(args.name)
+        emit({"ok": ok, "reason": err, "profile": args.name, "noop": ok and not changed}, args)
+        return 0 if ok else 1
+    if sub == "offset":
+        dev_id, _ = lact_device()
+        if not dev_id:
+            emit({"ok": False, "reason": "LACT lists no NVIDIA card"}, args)
+            return 1
+        seconds, err = lact_set_offsets(dev_id, lact_clocks(dev_id), args.core, args.mem)
+        emit({"ok": err is None, "reason": err, "core": args.core, "mem": args.mem,
+              "confirm_s": seconds}, args)
+        return 0 if err is None else 1
+    ok, err = lact_confirm(sub == "keep")
+    emit({"ok": ok, "reason": err, "kept": sub == "keep"}, args)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
@@ -1985,14 +2321,19 @@ def cmd_status(args):
     state = load_state()
     max_pct = state.get("max_pct", DEFAULT_MAX_PCT) if state else DEFAULT_MAX_PCT
     level = state.get("level", args.level) if state else args.level
+    limits = state_limits(state) if state else limits_from_args(args)
+    written = (state or {}).get("written") or {}
 
     knobs = []
     for knob in KNOBS:
         if not available(knob):
             continue
         current = read_knob(knob)
-        applies = actionable(knob, level)
-        target = eco_value(knob, max_pct, level) if applies else None
+        applies = actionable(knob, level, limits)
+        target = eco_value(knob, max_pct, level, limits) if applies else None
+        # At target also when the kernel kept a rounded value of it (the
+        # PL1 window): what it read back after the write is Eco's.
+        kept = [written.get(p) for p in expand(knob)]
         knobs.append({
             "id": knob["id"],
             "label": knob["label"],
@@ -2000,7 +2341,8 @@ def cmd_status(args):
             "current_human": humanize(knob, current),
             "eco_target": target,
             "eco_target_human": humanize(knob, target) if target else None,
-            "at_eco": (target is not None and current == target),
+            "at_eco": (target is not None and current is not None
+                       and (current == target or current in kept)),
             "managed": knob["ppd_owned"],
             "in_level": applies,
             "risk": knob["risk"],
@@ -2008,16 +2350,21 @@ def cmd_status(args):
             "saved": (state or {}).get("knobs", {}).get(knob["id"]),
         })
 
+    dgpu = dgpu_info(deep=args.deep)
     result = {
         "on": is_on(),
         "since": (state or {}).get("since"),
         "level": level,
         "max_pct": max_pct,
+        "limits": limits_public(limits),
         "ppd_profile": ppd_profile(),
         "cpu_avg_mhz": cpu_avg_mhz(),
         "cpu": cpu_info(),
-        "dgpu": dgpu_info(deep=args.deep),
+        "dgpu": dgpu,
         "gpu_caps_target": GPU_CAPS.get(level),
+        # The offsets go to the driver, so they are asked as nvidia-smi is:
+        # with --deep, and only while the card is awake anyway.
+        "lact": lact_info(clocks=args.deep and dgpu["runtime_status"] == "active"),
         # Recorded at apply time by the privileged path; readable here
         # because the state file is world-readable while energy_uj is not.
         "power_before": (state or {}).get("power_before"),
@@ -2052,11 +2399,13 @@ def cmd_on(args):
 
     max_pct = args.max_pct
     level = args.level
+    limits = limits_from_args(args)
     switched = False
 
     state = load_state()
     if state:
-        if state.get("level") == level and state.get("max_pct") == max_pct:
+        if (state.get("level") == level and state.get("max_pct") == max_pct
+                and state_limits(state) == limits):
             return reapply(state, args)
         # Switching level while on. Put every knob back to its recorded
         # original first, so the new level is captured against untouched
@@ -2085,9 +2434,9 @@ def cmd_on(args):
     power_before = sample_power(POWER_WINDOW_S)
 
     for knob in KNOBS:
-        if not actionable(knob, level):
+        if not actionable(knob, level, limits):
             continue
-        target = eco_value(knob, max_pct, level)
+        target = eco_value(knob, max_pct, level, limits)
         paths = expand(knob)
 
         # Record prior value per concrete path BEFORE touching anything.
@@ -2114,6 +2463,7 @@ def cmd_on(args):
         "since": int(time.time()),
         "level": level,
         "max_pct": max_pct,
+        "limits": limits,
         "power_before": power_before,
         "power_after": power_after,
         "knobs": saved,
@@ -2121,8 +2471,9 @@ def cmd_on(args):
     })
     gpu = gpu_on(level)
 
-    verdict = selftest("on", max_pct, level)
+    verdict = selftest("on", max_pct, level, limits)
     emit({"ok": not failed and verdict["pass"], "level": level,
+          "limits": limits_public(limits),
           "switched": switched,
           "applied": applied, "failed": failed, "selftest": verdict,
           "gpu": gpu,
@@ -2147,11 +2498,12 @@ def drifted(state):
     """
     level = state.get("level", DEFAULT_LEVEL)
     max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    limits = state_limits(state)
     out = []
     for knob in KNOBS:
-        if not actionable(knob, level):
+        if not actionable(knob, level, limits):
             continue
-        target = eco_value(knob, max_pct, level)
+        target = eco_value(knob, max_pct, level, limits)
         for path in expand(knob):
             current = read_path(path)
             if current is not None and current != ours(state, path, target):
@@ -2166,6 +2518,7 @@ def reapply(state, args):
     Nothing drifted is a no-op."""
     level = state.get("level", DEFAULT_LEVEL)
     max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    limits = state_limits(state)
     repaired, failed = [], []
     for knob, path, current, target in drifted(state):
         state.setdefault("knobs", {}).setdefault(knob["id"], {})[path] = current
@@ -2185,7 +2538,7 @@ def reapply(state, args):
     if not repaired and not failed:
         emit({"ok": True, "noop": True, "msg": "already on"}, args)
         return 0
-    verdict = selftest("on", max_pct, level)
+    verdict = selftest("on", max_pct, level, limits)
     ok = not failed and verdict["pass"]
     emit({"ok": ok, "level": level, "repaired": sorted(set(repaired)),
           "failed": failed, "selftest": verdict}, args)
@@ -2202,12 +2555,14 @@ def restore_all(state):
     """
     level = state.get("level", DEFAULT_LEVEL)
     max_pct = state.get("max_pct", DEFAULT_MAX_PCT)
+    limits = state_limits(state)
     restored, failed, kept = [], [], []
     for knob in KNOBS:
         entry = state.get("knobs", {}).get(knob["id"])
         if not entry:
             continue
-        target = eco_value(knob, max_pct, level) if in_level(knob, level) else None
+        target = (eco_value(knob, max_pct, level, limits)
+                  if in_level(knob, level, limits) else None)
         errors = []
         for path, prior in entry.items():
             if prior is None:
@@ -2278,17 +2633,28 @@ def compare_knob(knob, target, current):
         # Value stuck, but the effect it permits is not guaranteed.
         return "pass", None
 
+    if mode == "rounded":
+        # The kernel keeps the nearest value the hardware can hold (the PL1
+        # window is 2^Y * (1 + Z/4) time units), so within a tenth is the
+        # write that was asked for; further off, something else wrote it.
+        try:
+            close = abs(int(current) - int(target)) <= max(1, int(target) // 10)
+        except (TypeError, ValueError):
+            close = False
+        return ("pass", None) if close else ("fail", "reads back " +
+                                                 humanize(knob, current))
+
     return ("pass", None) if current == target else ("fail", "reads back " +
                                                      humanize(knob, current))
 
 
-def selftest(expect, max_pct, level):
+def selftest(expect, max_pct, level, limits=None):
     """After apply: every applied knob must verify under its comparator."""
     checks = []
     for knob in KNOBS:
-        if not actionable(knob, level):
+        if not actionable(knob, level, limits):
             continue
-        target = eco_value(knob, max_pct, level)
+        target = eco_value(knob, max_pct, level, limits)
         current = read_knob(knob)
         status, note = compare_knob(knob, target, current)
         checks.append({
@@ -2434,7 +2800,7 @@ def cmd_selftest(args):
     state = load_state()
     if state:
         verdict = selftest("on", state.get("max_pct", DEFAULT_MAX_PCT),
-                           state.get("level", DEFAULT_LEVEL))
+                           state.get("level", DEFAULT_LEVEL), state_limits(state))
         verdict["applicable"] = True
     else:
         # Reporting "passed, 0 checks" here would be a lie dressed as a
@@ -2481,6 +2847,24 @@ def render(data):
                          f"{c.get('eff_pl2_w') or 0:g} W  (MSR {c.get('pl1_w')}/"
                          f"{c.get('pl2_w')}, MMIO {c.get('mmio_pl1_w')}/"
                          f"{c.get('mmio_pl2_w')})")
+        if data.get("limits"):
+            lines.append("  Eco limits from the settings: " + ", ".join(
+                f"{k.upper() if k != 'tau' else 'Tau'} {v:g} {'s' if k == 'tau' else 'W'}"
+                for k, v in data["limits"].items()))
+        lact = data.get("lact") or {}
+        if lact.get("available"):
+            lines.append("")
+            lines.append(f"  LACT: profile {lact.get('current') or 'default'}"
+                         + (" (auto-switch)" if lact.get("auto_switch") else "")
+                         + f", profiles: {', '.join(lact.get('profiles') or []) or '-'}")
+            clocks = lact.get("clocks") or {}
+            if clocks.get("core") or clocks.get("mem"):
+                core, mem = clocks.get("core") or {}, clocks.get("mem") or {}
+                lines.append(f"        GPU offsets: core {core.get('current'):+} MHz "
+                             f"({core.get('min')}..{core.get('max')}), memory "
+                             f"{mem.get('current'):+} MHz ({mem.get('min')}..{mem.get('max')})")
+            elif clocks.get("error"):
+                lines.append(f"        GPU offsets: {clocks['error']}")
         g = data.get("dgpu") or {}
         if g.get("present"):
             lines.append("")
@@ -2541,6 +2925,7 @@ def main():
                       dest="max_pct",
                       help="CPU ceiling percent for 'deep', 10..100 (default 40); "
                            f"'deepest' uses at most {DEEPEST_MAX_PCT}")
+    add_limit_args(p_on)
     p_on.set_defaults(func=cmd_on)
 
     sub.add_parser("off", help="restore previous values").set_defaults(func=cmd_off)
@@ -2551,7 +2936,28 @@ def main():
                            "(wakes the dGPU - not for polling)")
     p_st.add_argument("--level", choices=LEVELS, default=DEFAULT_LEVEL,
                       help="level to compare against when eco is off")
+    add_limit_args(p_st)
     p_st.set_defaults(func=cmd_status)
+
+    p_gpu = sub.add_parser("gpu", help="the dGPU's clock offsets, through LACT "
+                                       "(no root: the lactd socket is the "
+                                       "wheel group's)")
+    gsub = p_gpu.add_subparsers(dest="gpu_cmd")
+    p_gs = gsub.add_parser("status", help="LACT's profiles and the offsets in force")
+    p_gs.add_argument("--clocks", action="store_true",
+                      help="also read the offsets (talks to the driver: wakes "
+                           "a sleeping dGPU)")
+    gsub.add_parser("profile", help="select a LACT profile ('default' for "
+                                    "LACT's own), auto-switch off"
+                    ).add_argument("name")
+    p_go = gsub.add_parser("offset", help="write the P0 clock offsets into the "
+                                          "LACT profile in force and apply them; "
+                                          "kept only after `gpu keep`")
+    p_go.add_argument("--core", type=int, help="graphics clock offset, MHz")
+    p_go.add_argument("--mem", type=int, help="memory clock offset, MHz")
+    gsub.add_parser("keep", help="keep the offsets just applied (LACT saves them)")
+    gsub.add_parser("revert", help="put the previous offsets back now")
+    p_gpu.set_defaults(func=cmd_gpu)
 
     sub.add_parser("selftest", help="verify applied state").set_defaults(func=cmd_selftest)
 
@@ -2619,8 +3025,26 @@ def main():
     if args.cmd == "on" and not (lo <= args.max_pct <= hi):
         print(f"ecomode: --max-pct must be {lo}..{hi}", file=sys.stderr)
         return 2
+    if args.cmd in ("on", "status"):
+        why = check_limits(args)
+        if why:
+            print(f"ecomode: {why}", file=sys.stderr)
+            return 2
 
     return args.func(args)
+
+
+def add_limit_args(parser):
+    lo, hi = PL_RANGE_W
+    tlo, thi = TAU_RANGE_S
+    parser.add_argument("--pl1", type=float, default=None,
+                        help=f"sustained power limit in W, {lo}..{hi}, over the "
+                             "level's own")
+    parser.add_argument("--pl2", type=float, default=None,
+                        help=f"burst power limit in W, {lo}..{hi}, over the "
+                             "level's own (at gentle too)")
+    parser.add_argument("--tau", type=float, default=None,
+                        help=f"PL1 time window in s, {tlo}..{thi}")
 
 
 if __name__ == "__main__":

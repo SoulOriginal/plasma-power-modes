@@ -8,6 +8,46 @@
 // shell command line, so anything else falls back to the firmware's curve.
 var FAN_MODES = ["auto", "max", "boost"]
 var LEVELS = ["gentle", "deep", "deepest"]
+// The power limits from the settings (ecoPl1W, ecoPl2W, ecoTauS), as the
+// helper bounds them; 0 means "the level's own". Anything outside is left
+// unsaid rather than sent.
+var PL_RANGE_W = [5, 250]
+var TAU_RANGE_S = [1, 120]
+
+// A string as one shell word: LACT profile names are the user's own and go
+// through the executable engine's shell.
+function shellQuote(s) {
+    return "'" + String(s).replace(/'/g, "'\\''") + "'"
+}
+
+// {pl1, pl2, tau} from the settings, only the values in range; the same
+// numbers the helper's status reports back as `limits`.
+function limitsOf(o) {
+    var out = {}
+    var pl1 = Math.round(Number(o.pl1)) || 0, pl2 = Math.round(Number(o.pl2)) || 0
+    var tau = Math.round(Number(o.tau)) || 0
+    if (pl1 >= PL_RANGE_W[0] && pl1 <= PL_RANGE_W[1]) out.pl1 = pl1
+    if (pl2 >= PL_RANGE_W[0] && pl2 <= PL_RANGE_W[1]) out.pl2 = pl2
+    // The helper refuses a burst limit under the sustained one.
+    if (out.pl1 !== undefined && out.pl2 !== undefined && out.pl2 < out.pl1) delete out.pl2
+    if (tau >= TAU_RANGE_S[0] && tau <= TAU_RANGE_S[1]) out.tau = tau
+    return out
+}
+
+function limitFlags(limits) {
+    var s = ""
+    if (limits.pl1 !== undefined) s += " --pl1 " + limits.pl1
+    if (limits.pl2 !== undefined) s += " --pl2 " + limits.pl2
+    if (limits.tau !== undefined) s += " --tau " + limits.tau
+    return s
+}
+
+// The LACT profile Max selects: "" leaves the dGPU alone, "default" is
+// LACT's own, anything else a profile name (the helper checks it exists).
+function gpuProfileFlag(name) {
+    name = String(name || "")
+    return name === "" ? "" : " --gpu-profile " + shellQuote(name)
+}
 
 // Shell commands taking the machine from one mode to another, in order.
 // Both helpers run through pkexec, and polkit lets the active local session
@@ -17,11 +57,11 @@ function commandsFor(from, to, o) {
     var level = LEVELS.indexOf(o.level) >= 0 ? o.level : "gentle"
     var pct = Math.max(20, Math.min(100, Math.round(Number(o.maxPct)) || 40))
     var ecoOn = "pkexec " + o.helper + " --json on --level " + level +
-                " --max-pct " + pct
+                " --max-pct " + pct + limitFlags(limitsOf(o))
     var ecoOff = "pkexec " + o.helper + " --json off"
     var fans = FAN_MODES.indexOf(o.fans) >= 0 ? o.fans : "auto"
     var maxOn = "pkexec " + o.maxHelper + " --json on --fans " + fans +
-                (o.gpuBoost ? " --gpu-boost" : "")
+                (o.gpuBoost ? " --gpu-boost" : "") + gpuProfileFlag(o.gpuProfile)
     var maxOff = "pkexec " + o.maxHelper + " --json off"
 
     if (from === to) {
@@ -40,13 +80,24 @@ function commandsFor(from, to, o) {
     return from === "max" ? [maxOff, ecoOn] : [ecoOn]
 }
 
-// Whether the status shows Eco on with exactly this level and ceiling, and
-// every knob of the level still at Eco's value (a profile change makes the
-// firmware rewrite the power limits under it).
+// Whether the status shows Eco on with exactly this level, ceiling and
+// settings' limits, and every knob of the level still at Eco's value (a
+// profile change makes the firmware rewrite the power limits under it).
 function ecoApplied(st, o) {
     if (!st || st.mode !== "eco" || st.level !== o.level || st.max_pct !== o.maxPct)
         return false
+    if (!sameLimits(st.limits || {}, limitsOf(o))) return false
     return !ecoDrifted(st)
+}
+
+function sameLimits(a, b) {
+    var keys = ["pl1", "pl2", "tau"]
+    for (var i = 0; i < keys.length; i++) {
+        var x = a[keys[i]], y = b[keys[i]]
+        if ((x === undefined || x === null) !== (y === undefined || y === null)) return false
+        if (x !== undefined && x !== null && Number(x) !== Number(y)) return false
+    }
+    return true
 }
 
 function ecoDrifted(st) {
@@ -333,6 +384,79 @@ function statusWithMax(st, max) {
     out.max = max
     out.fans = { available: (st.fans || {}).available, rpm: [], pwm_enable: null }
     out.pkg_temp_c = null
+    return out
+}
+
+// The current reading of one knob from status.knobs, "" if absent.
+function knobValue(st, id) {
+    var ks = (st && st.knobs) || []
+    for (var i = 0; i < ks.length; i++)
+        if (ks[i].id === id) return ks[i].current_human || ""
+    return ""
+}
+
+function isNum(v) { return typeof v === "number" && !isNaN(v) }
+
+// The settings' limits as a line: "PL1 30 W · PL2 40 W · Tau 28 s", "" with none.
+function limitsText(limits) {
+    if (!limits) return ""
+    var p = []
+    if (isNum(limits.pl1)) p.push("PL1 " + limits.pl1 + " W")
+    if (isNum(limits.pl2)) p.push("PL2 " + limits.pl2 + " W")
+    if (isNum(limits.tau)) p.push("Tau " + limits.tau + " s")
+    return p.join(" · ")
+}
+
+// ── The dGPU through LACT ─────────────────────────────────────────────────
+// "+100 MHz", "−50 MHz", "0 MHz"; "" without a number.
+function offsetText(n) {
+    if (!isNum(n)) return ""
+    return (n > 0 ? "+" : n < 0 ? "−" : "") + Math.abs(n) + " MHz"
+}
+
+// The LACT profile's display name: LACT's own unnamed profile is "default".
+function lactProfileName(name) {
+    return name === null || name === undefined || name === "" ? "default" : name
+}
+
+// The GPU clocks card's subtitle: the profile in force and the offsets, when read.
+function lactSummary(l) {
+    if (!l || !l.available) return l && l.error ? l.error : ""
+    var p = ["profile " + lactProfileName(l.current) + (l.auto_switch ? " (auto)" : "")]
+    var c = l.clocks || {}
+    if (c.core && isNum(c.core.current)) p.push("core " + offsetText(c.core.current))
+    if (c.mem && isNum(c.mem.current)) p.push("memory " + offsetText(c.mem.current))
+    return p.join(" · ")
+}
+
+// Why the offsets are not shown, "" when they are.
+function lactClocksNote(l, dgpu) {
+    if (!l || !l.available) return ""
+    var c = l.clocks
+    if (c && !c.error && (c.core || c.mem)) return ""
+    if (c && c.error) return c.error
+    if (dgpu && dgpu.runtime_status === "suspended")
+        return "The offsets are read while the GPU is awake; it is asleep now."
+    return "Offsets not read yet."
+}
+
+// The power limit the vBIOS holds, from the driver's reading: "115 W, set
+// by the vBIOS · Dynamic Boost to 140 W".
+function gpuLimitText(q) {
+    if (!q || !isNum(q.limit_w)) return ""
+    var s = Math.round(q.limit_w) + " W, set by the vBIOS"
+    if (isNum(q.max_limit_w) && q.max_limit_w > q.limit_w)
+        s += " · Dynamic Boost to " + Math.round(q.max_limit_w) + " W"
+    return s
+}
+
+// The choices for the Max "GPU profile" row: leave alone, LACT's default,
+// each named profile.
+function gpuProfileChoices(l) {
+    var out = [{ id: "", text: "Leave as is" }, { id: "default", text: "LACT default" }]
+    var names = (l && l.profiles) || []
+    for (var i = 0; i < names.length; i++)
+        if (names[i] !== "" && names[i] !== "default") out.push({ id: names[i], text: names[i] })
     return out
 }
 

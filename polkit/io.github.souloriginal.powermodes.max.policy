@@ -18,7 +18,9 @@
        - start and stop the root watts sampler, which publishes an averaged
          CPU package wattage, what limits the CPU right now (read-only MSR
          0x64F) and, while another process keeps the dGPU awake, its load,
-         clocks and draw.
+         clocks and draw;
+       - select a LACT profile for the dGPU while Max runs and put the
+         previous one back when it ends (the name must be one LACT lists).
        Every argument is checked; there are no free-form paths or values. -->
   <action id="io.github.souloriginal.powermodes.max">
     <description>Toggle Max power mode and the CPU watts sampler</description>

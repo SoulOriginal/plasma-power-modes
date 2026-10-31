@@ -2758,5 +2758,81 @@ check("no hp fan control: refused", code == 1, res)
 reset()
 
 # ---------------------------------------------------------------------------
+# 47. the dGPU's LACT profile while Max runs
+# ---------------------------------------------------------------------------
+print("\n\033[1m47. the dGPU's LACT profile while Max runs\033[0m")
+ORIG_LACT = (eco.lact_profiles, eco.lact_set_profile, eco.lact_call, eco.GPU_PROFILE_FILE)
+temp_run()
+rec = stub_env()
+eco.GPU_PROFILE_FILE = str(TMP / "run" / "gpu-profile.json")
+LACT_STATE = {"current": "Overclock", "auto": True}
+LACT_NAMES = ["Overclock", "Quiet"]
+
+
+def fake_profiles():
+    return LACT_NAMES, LACT_STATE["current"], LACT_STATE["auto"], None
+
+
+def fake_set_profile(name):
+    want = None if name == "default" else name
+    if want is not None and want not in LACT_NAMES:
+        return False, f"LACT has no profile named {want!r}", False
+    LACT_STATE.update(current=want, auto=False)
+    return True, None, True
+
+
+def fake_lact_call(cmd, a=None):
+    if cmd == "set_profile":
+        LACT_STATE.update(current=a["name"], auto=a["auto_switch"])
+        return None, None
+    return None, f"unexpected {cmd}"
+
+
+eco.lact_profiles, eco.lact_set_profile, eco.lact_call = fake_profiles, fake_set_profile, fake_lact_call
+code, res = capture(mx.cmd_on, cli_args(gpu_profile="Quiet"))
+rec_file = eco.read_json(eco.GPU_PROFILE_FILE)
+check("on --gpu-profile selects it, records the prior one, starts Max",
+      code == 0 and LACT_STATE == {"current": "Quiet", "auto": False}
+      and rec_file == {"prior": "Overclock", "prior_auto": True, "want": "Quiet"}
+      and len(started(rec)) > 0 and res["gpu_profile"]["want"] == "Quiet", (res, rec_file, LACT_STATE))
+eco.max_state = lambda: {"pid": 1, "fans": "auto", "state": "active"}
+code, res = capture(mx.cmd_on, cli_args(gpu_profile="default"))
+check("another profile while Max runs: taken without a restart, the prior kept",
+      code == 0 and res.get("noop") is True and LACT_STATE["current"] is None
+      and eco.read_json(eco.GPU_PROFILE_FILE)["prior"] == "Overclock", (res, LACT_STATE))
+code, res = capture(mx.cmd_on, cli_args(gpu_profile=""))
+check("the option switched off while Max runs gives the profile back",
+      code == 0 and res.get("noop") is True and LACT_STATE == {"current": "Overclock", "auto": True}
+      and not os.path.exists(eco.GPU_PROFILE_FILE), (res, LACT_STATE))
+code, res = capture(mx.cmd_on, cli_args(gpu_profile="nope"))
+check("a profile LACT does not list refuses Max",
+      code == 1 and "nope" in res["reason"] and LACT_STATE["current"] == "Overclock", res)
+capture(mx.cmd_on, cli_args(gpu_profile="Quiet"))
+eco.max_state = lambda: None
+code, res = capture(mx.cmd_off, cli_args())
+check("off puts the LACT profile back",
+      code == 0 and res["gpu_profile"] == {"restored": True, "ok": True, "error": None}
+      and LACT_STATE == {"current": "Overclock", "auto": True}, (res, LACT_STATE))
+code, res = capture(mx.cmd_off, cli_args())
+check("off with nothing taken touches nothing", res["gpu_profile"]["restored"] is False, res)
+eco.gpu_profile_take("Quiet")
+os.environ["INVOCATION_ID"] = "test"
+code, _ = capture(mx.cmd_cleanup, cli_args())
+os.environ.pop("INVOCATION_ID")
+check("cleanup after a crash or logout gives it back too",
+      code == 0 and LACT_STATE == {"current": "Overclock", "auto": True}
+      and not os.path.exists(eco.GPU_PROFILE_FILE), LACT_STATE)
+mx.wait_for_state = lambda timeout=3.0, step=0.1: None
+code, res = capture(mx.cmd_on, cli_args(gpu_profile="Quiet"))
+check("a keeper that fails to start gives the profile back",
+      code == 1 and LACT_STATE == {"current": "Overclock", "auto": True}
+      and not os.path.exists(eco.GPU_PROFILE_FILE), (res, LACT_STATE))
+check("without the option nothing asks LACT at all",
+      (LACT_STATE.update(current="Quiet", auto=False),
+       capture(mx.cmd_on, cli_args()), LACT_STATE)[2] == {"current": "Quiet", "auto": False})
+eco.lact_profiles, eco.lact_set_profile, eco.lact_call, eco.GPU_PROFILE_FILE = ORIG_LACT
+reset()
+
+# ---------------------------------------------------------------------------
 print(f"\n\033[1m{PASS} passed, {FAIL} failed\033[0m")
 sys.exit(1 if FAIL else 0)

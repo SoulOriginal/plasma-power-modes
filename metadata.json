@@ -8,7 +8,7 @@
         "Version": "1.0.0",
         "License": "GPL-2.0-or-later",
         "Category": "System Information",
-        "Authors": [{"Name": "SoulOriginal"}],
+        "Authors": [{"Name": "SoulOriginal"}, {"Name": "qxoo"}],
         "Website": "https://github.com/SoulOriginal/plasma-power-modes",
         "BugReportUrl": "https://github.com/SoulOriginal/plasma-power-modes/issues",
         "MimeTypes": []

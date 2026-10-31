@@ -46,9 +46,19 @@ PlasmoidItem {
     // Two-way: with following on, a mode picked here also moves the KDE slider.
     readonly property bool syncProfile: followProfile && Plasmoid.configuration.syncProfile === true
     readonly property bool gpuBoost: Plasmoid.configuration.gpuBoost !== false
+    // Eco's power limits from the settings, W and s; 0 = the level's own.
+    readonly property int ecoPl1W: Plasmoid.configuration.ecoPl1W || 0
+    readonly property int ecoPl2W: Plasmoid.configuration.ecoPl2W || 0
+    readonly property int ecoTauS: Plasmoid.configuration.ecoTauS || 0
+    // The LACT profile Max selects for the dGPU; "" leaves it alone.
+    readonly property string maxGpuProfile: String(Plasmoid.configuration.maxGpuProfile || "")
     // Last record from the sampler, {cpu_w, battery_w, cpu_limit, gpu, at,
     // interval}, or null.
     property var watts: null
+    // A GPU offset change LACT holds until it is kept: {until: epoch s},
+    // or null. LACT puts the previous offsets back by itself at `until`.
+    property var gpuPending: null
+    property real gpuNow: Date.now() / 1000
 
     Plasmoid.icon: mode === "eco" ? "battery-profile-powersave"
                  : mode === "max" ? "battery-profile-performance"
@@ -156,12 +166,19 @@ PlasmoidItem {
         const cmds = Modes.commandsFor(mode, target, {
             helper: helper, maxHelper: maxHelper, level: level,
             maxPct: maxPct, fans: fansMode, gpuBoost: gpuBoost, status: status,
+            pl1: ecoPl1W, pl2: ecoPl2W, tau: ecoTauS, gpuProfile: maxGpuProfile,
             force: force === true
         })
         // Two-way sync: the slider is one more step, placed by withProfile().
         runSequence(Modes.withProfile(cmds,
             Modes.profileCommand(helper, target, kdeProfile, syncProfile), mode))
     }
+
+    // The settings' limits changed (Apply in the dialog): an Eco that is on
+    // takes them at once, in the one call that reverts the old values first.
+    // Off, nothing happens until Eco is next selected.
+    readonly property string ecoLimitsKey: ecoPl1W + "/" + ecoPl2W + "/" + ecoTauS
+    onEcoLimitsKeyChanged: if (mode === "eco" && status.knobs) setMode("eco")
 
     // Middle click on the panel.
     function toggle() {
@@ -192,6 +209,68 @@ PlasmoidItem {
         if (busy) return
         Plasmoid.configuration.gpuBoost = on
         if (mode === "max") Qt.callLater(setMode, "max")
+    }
+
+    // The LACT profile Max selects for the dGPU. While Max runs it is taken
+    // (or given back) at once: ecomode-max does that without restarting
+    // its keeper.
+    function setMaxGpuProfile(name) {
+        if (busy) return
+        Plasmoid.configuration.maxGpuProfile = name
+        if (mode === "max") Qt.callLater(setMode, "max")
+    }
+
+    // ── The dGPU through LACT ────────────────────────────────────────────────
+    // No pkexec: lactd's socket is the wheel group's. Every answer is the
+    // helper's JSON; a refusal lands in actionError like any other.
+    function gpuCmd(sub, cb) {
+        if (busy) return
+        busy = true
+        actionError = ""
+        runCmd(helper + " --json gpu " + sub, function(code, out, err) {
+            busy = false
+            let res = null
+            try { res = JSON.parse(out) } catch (e) {}
+            if (!res || !res.ok) actionError = res ? describeFailure(res) : (err || ("exited " + code))
+            if (cb) cb(res)
+            refresh()
+        })
+    }
+
+    function setGpuProfileNow(name) {
+        gpuCmd("profile " + Modes.shellQuote(name))
+    }
+
+    // Applies at once; LACT reverts by itself unless kept within the time
+    // it names, so the popup shows Keep / Revert with the countdown.
+    function setGpuOffsets(core, mem) {
+        gpuCmd("offset --core " + Math.round(core) + " --mem " + Math.round(mem), function(res) {
+            if (res && res.ok)
+                gpuPending = { until: Date.now() / 1000 + (Number(res.confirm_s) || 0) }
+        })
+    }
+
+    function gpuKeep() {
+        gpuCmd("keep", function(res) { if (res && res.ok) gpuPending = null })
+    }
+
+    function gpuRevert() {
+        gpuCmd("revert", function(res) { gpuPending = null })
+    }
+
+    Timer {
+        // The countdown of a pending offset change; LACT has reverted once
+        // it is over, so the offsets are read again then.
+        interval: 1000
+        running: root.gpuPending !== null
+        repeat: true
+        onTriggered: {
+            root.gpuNow = Date.now() / 1000
+            if (root.gpuPending && root.gpuNow >= root.gpuPending.until) {
+                root.gpuPending = null
+                root.refresh()
+            }
+        }
     }
 
     // Battery care: the helper saves the stop level and runs the root service

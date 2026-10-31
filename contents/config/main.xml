@@ -58,5 +58,21 @@
       <label>Run NVIDIA Dynamic Boost (nvidia-powerd) while Max is on</label>
       <default>true</default>
     </entry>
+    <entry name="ecoPl1W" type="Int">
+      <label>Eco: sustained power limit PL1 in W over the level's own, 5..250; 0 = the level's value</label>
+      <default>0</default>
+    </entry>
+    <entry name="ecoPl2W" type="Int">
+      <label>Eco: burst power limit PL2 in W over the level's own (at gentle too), 5..250; 0 = the level's value</label>
+      <default>0</default>
+    </entry>
+    <entry name="ecoTauS" type="Int">
+      <label>Eco: PL1 time window (Tau) in s, 1..120; 0 = untouched</label>
+      <default>0</default>
+    </entry>
+    <entry name="maxGpuProfile" type="String">
+      <label>The LACT profile selected for the dGPU while Max runs: a profile name, "default" for LACT's own, empty = leave the dGPU alone</label>
+      <default></default>
+    </entry>
   </group>
 </kcfg>

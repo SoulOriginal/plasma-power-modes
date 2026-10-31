@@ -31,6 +31,9 @@ Item {
     readonly property var gpuW: full.gq && typeof full.gq.power_w === "number"
                                 ? full.gq.power_w : null
     readonly property var cpuLimit: full.live ? Modes.cpuLimitText(full.live.cpu_limit) : null
+    // What LACT holds for the dGPU (status.lact), and the offsets it read.
+    readonly property var lact: st.lact || ({})
+    readonly property var lactClocks: (st.lact && st.lact.clocks) || ({})
 
     readonly property color modeColor: root.lastError !== "" ? "#f44336"
         : root.mode === "eco" ? "#4caf50"
@@ -303,6 +306,13 @@ Item {
                     opacity: 0.75
                     text: Modes.levelText(root.level, root.maxPct)
                 }
+                // The power limits from the settings, over the level's own.
+                Stat {
+                    visible: Modes.limitsText(st.limits) !== ""
+                    label: "Limits"
+                    value: Modes.limitsText(st.limits) + " · from the settings"
+                    wrap: true
+                }
             }
 
             Card {
@@ -377,6 +387,47 @@ Item {
                         : "nvidia-powerd off: the GPU keeps its base power limit"
                     on: root.gpuBoost
                     onToggled: function(want) { root.setGpuBoost(want) }
+                }
+
+                // The dGPU's LACT profile while Max runs: an overclock defined
+                // in LACT, selected at start and put back at the end. Only
+                // with lactd answering.
+                PC3.Label {
+                    visible: full.lact.available === true
+                    text: "GPU profile (LACT)"
+                    opacity: 0.65
+                    font: Kirigami.Theme.smallFont
+                    Layout.topMargin: Kirigami.Units.smallSpacing
+                }
+                PC3.ComboBox {
+                    id: maxGpuCombo
+                    visible: full.lact.available === true
+                    Layout.fillWidth: true
+                    enabled: !root.busy
+                    textRole: "text"
+                    valueRole: "id"
+                    model: Modes.gpuProfileChoices(full.lact)
+                    currentIndex: Math.max(0, indexOfValue(root.maxGpuProfile))
+                    onActivated: function(index) {
+                        const want = currentValue
+                        currentIndex = Qt.binding(function() {
+                            return Math.max(0, indexOfValue(root.maxGpuProfile)) })
+                        root.setMaxGpuProfile(want)
+                    }
+                }
+                PC3.Label {
+                    visible: full.lact.available === true
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                    text: root.maxGpuProfile === ""
+                        ? "The GPU keeps whatever LACT profile is in force."
+                        : "LACT profile “" + Modes.lactProfileName(root.maxGpuProfile)
+                          + "” while Max runs; the previous one comes back when it ends."
+                          + (full.lact.max_record
+                             ? " Before Max: " + Modes.lactProfileName(full.lact.max_record.prior) + "."
+                             : "")
                 }
 
                 PC3.Label {
@@ -456,6 +507,8 @@ Item {
                     label: "Power limits"
                     value: full.has(full.cpu.eff_pl1_w)
                         ? "PL1 " + full.cpu.eff_pl1_w + " W · PL2 " + full.cpu.eff_pl2_w + " W"
+                          + (Modes.knobValue(st, "rapl_tau")
+                             ? " · Tau " + Modes.knobValue(st, "rapl_tau") : "")
                         : "—"
                 }
                 Stat {
@@ -642,6 +695,188 @@ Item {
                 }
             }
 
+            // ── GPU clocks (LACT) ────────────────────────────────────────────
+            // The clock offsets LACT holds for the dGPU, and its profiles.
+            // The power limit is the vBIOS's and cannot be set here; the
+            // offsets apply at once and LACT reverts them by itself unless
+            // kept within the time it names. Shown only while lactd answers.
+            Card {
+                id: gpuClocks
+                visible: full.lact.available === true
+                title: "GPU clocks"
+                subtitle: Modes.lactSummary(full.lact)
+                icon: "video-card-symbolic"
+                readonly property var core: full.lactClocks.core || null
+                readonly property var mem: full.lactClocks.mem || null
+                readonly property bool readable: core !== null || mem !== null
+                readonly property int secondsLeft: root.gpuPending
+                    ? Math.max(0, Math.round(root.gpuPending.until - root.gpuNow)) : 0
+
+                PC3.Label {
+                    text: "LACT profile"
+                    opacity: 0.65
+                    font: Kirigami.Theme.smallFont
+                }
+                PC3.ComboBox {
+                    id: lactCombo
+                    Layout.fillWidth: true
+                    enabled: !root.busy && root.gpuPending === null
+                    textRole: "text"
+                    valueRole: "id"
+                    // LACT's own profile and each named one.
+                    model: Modes.gpuProfileChoices(full.lact).slice(1)
+                    currentIndex: Math.max(0, indexOfValue(Modes.lactProfileName(full.lact.current)))
+                    onActivated: function(index) {
+                        const want = currentValue
+                        currentIndex = Qt.binding(function() {
+                            return Math.max(0, indexOfValue(Modes.lactProfileName(full.lact.current))) })
+                        root.setGpuProfileNow(want)
+                    }
+                }
+                PC3.Label {
+                    visible: full.lact.auto_switch === true
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                    text: "LACT switches profiles by its own rules now; picking one here turns that off."
+                }
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: Kirigami.Units.smallSpacing
+                    visible: gpuClocks.readable
+                    columns: 3
+                    rowSpacing: 2
+                    columnSpacing: Kirigami.Units.smallSpacing
+
+                    PC3.Label {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 4
+                        text: "Core offset"
+                        opacity: 0.65
+                        font: Kirigami.Theme.smallFont
+                    }
+                    SpinBox {
+                        id: coreSpin
+                        Layout.fillWidth: true
+                        enabled: !root.busy && root.gpuPending === null && gpuClocks.core !== null
+                        from: gpuClocks.core ? gpuClocks.core.min : 0
+                        to: gpuClocks.core ? gpuClocks.core.max : 0
+                        stepSize: 5
+                        value: gpuClocks.core ? gpuClocks.core.current : 0
+                        textFromValue: function(v) { return Modes.offsetText(v) }
+                        valueFromText: function(t) { return parseInt(String(t).replace("−", "-")) || 0 }
+                        editable: true
+                    }
+                    PC3.Label {
+                        opacity: 0.6
+                        font: Kirigami.Theme.smallFont
+                        text: gpuClocks.core ? "now " + Modes.offsetText(gpuClocks.core.current) : ""
+                    }
+
+                    PC3.Label {
+                        Layout.preferredWidth: Kirigami.Units.gridUnit * 4
+                        text: "Memory offset"
+                        opacity: 0.65
+                        font: Kirigami.Theme.smallFont
+                    }
+                    SpinBox {
+                        id: memSpin
+                        Layout.fillWidth: true
+                        enabled: !root.busy && root.gpuPending === null && gpuClocks.mem !== null
+                        from: gpuClocks.mem ? gpuClocks.mem.min : 0
+                        to: gpuClocks.mem ? gpuClocks.mem.max : 0
+                        stepSize: 10
+                        value: gpuClocks.mem ? gpuClocks.mem.current : 0
+                        textFromValue: function(v) { return Modes.offsetText(v) }
+                        valueFromText: function(t) { return parseInt(String(t).replace("−", "-")) || 0 }
+                        editable: true
+                    }
+                    PC3.Label {
+                        opacity: 0.6
+                        font: Kirigami.Theme.smallFont
+                        text: gpuClocks.mem ? "now " + Modes.offsetText(gpuClocks.mem.current) : ""
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: gpuClocks.readable && root.gpuPending === null
+                    spacing: Kirigami.Units.smallSpacing
+
+                    PC3.Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        font: Kirigami.Theme.smallFont
+                        opacity: 0.7
+                        text: "Written into the LACT profile in force and applied at once. "
+                              + "LACT puts the previous offsets back by itself unless you keep them."
+                    }
+                    PC3.Button {
+                        text: "Apply"
+                        icon.name: "dialog-ok-apply"
+                        enabled: !root.busy && gpuClocks.readable
+                                 && (coreSpin.value !== (gpuClocks.core ? gpuClocks.core.current : 0)
+                                     || memSpin.value !== (gpuClocks.mem ? gpuClocks.mem.current : 0))
+                        onClicked: root.setGpuOffsets(coreSpin.value, memSpin.value)
+                    }
+                }
+
+                Kirigami.InlineMessage {
+                    Layout.fillWidth: true
+                    visible: root.gpuPending !== null
+                    type: Kirigami.MessageType.Warning
+                    text: "New offsets applied. Keep them? LACT reverts in " + gpuClocks.secondsLeft + " s."
+                    actions: [
+                        Kirigami.Action {
+                            text: "Keep"
+                            icon.name: "dialog-ok"
+                            enabled: !root.busy
+                            onTriggered: root.gpuKeep()
+                        },
+                        Kirigami.Action {
+                            text: "Revert"
+                            icon.name: "edit-undo"
+                            enabled: !root.busy
+                            onTriggered: root.gpuRevert()
+                        }
+                    ]
+                }
+
+                PC3.Label {
+                    visible: !gpuClocks.readable
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                    text: Modes.lactClocksNote(full.lact, full.dgpu)
+                }
+
+                Stat {
+                    visible: Modes.gpuLimitText(full.gq) !== ""
+                    label: "Power limit"
+                    value: Modes.gpuLimitText(full.gq)
+                    wrap: true
+                }
+                Stat {
+                    visible: (full.lactClocks.core_locked || []).length === 2
+                    label: "Clock range"
+                    value: (full.lactClocks.core_locked || []).join("–") + " MHz core"
+                           + ((full.lactClocks.mem_locked || []).length === 2
+                              ? " · " + full.lactClocks.mem_locked.join("–") + " MHz memory" : "")
+                }
+                PC3.Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.55
+                    text: "The power limit is the vBIOS's (nvidia-smi refuses to change it on "
+                          + "these laptops), so the only overclock is these offsets. LACT applies "
+                          + "them again at boot and after the card slept. An unstable value can "
+                          + "hang the GPU: raise in small steps and test under load."
+                }
+            }
+
             // ── Laptop ───────────────────────────────────────────────────────
             Card {
                 id: laptop
@@ -796,6 +1031,8 @@ Item {
                                     font: Kirigami.Theme.smallFont
                                     text: modelData.managed
                                         ? "managed by power-profiles-daemon"
+                                        : modelData.id === "rapl_tau"
+                                        ? "set from the settings only"
                                         : "used by the Deep levels"
                                 }
                             }

@@ -25,6 +25,10 @@ Kirigami.FormLayout {
     property alias cfg_followProfile: followBox.checked
     property alias cfg_syncProfile: syncBox.checked
     property alias cfg_gpuBoost: gpuBoostBox.checked
+    property alias cfg_ecoPl1W: pl1Spin.value
+    property alias cfg_ecoPl2W: pl2Spin.value
+    property alias cfg_ecoTauS: tauSpin.value
+    property alias cfg_maxGpuProfile: gpuProfileField.text
 
     // The fan mode the widget runs with, as main.qml works it out.
     readonly property string fansShown: fansGroup.value || (cfg_fansMax ? "max" : "auto")
@@ -131,6 +135,54 @@ Kirigami.FormLayout {
               "above 30 %."
     }
 
+    // The CPU's RAPL limits by hand, over the level's own. 0 stands for the
+    // level's value; the helper takes 5..250 W and 1..120 s.
+    SpinBox {
+        id: pl1Spin
+        Kirigami.FormData.label: "Sustained (PL1):"
+        from: 0
+        to: 250
+        stepSize: 5
+        textFromValue: function(v) { return v === 0 ? "level's own" : v + " W" }
+        valueFromText: function(t) { return parseInt(t) || 0 }
+    }
+
+    SpinBox {
+        id: pl2Spin
+        Kirigami.FormData.label: "Burst (PL2):"
+        from: 0
+        to: 250
+        stepSize: 5
+        textFromValue: function(v) { return v === 0 ? "level's own" : v + " W" }
+        valueFromText: function(t) { return parseInt(t) || 0 }
+    }
+
+    SpinBox {
+        id: tauSpin
+        Kirigami.FormData.label: "PL1 window (Tau):"
+        from: 0
+        to: 120
+        stepSize: 1
+        textFromValue: function(v) { return v === 0 ? "untouched" : v + " s" }
+        valueFromText: function(t) { return parseInt(t) || 0 }
+    }
+
+    Label {
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+        wrapMode: Text.WordWrap
+        opacity: 0.7
+        font: Kirigami.Theme.smallFont
+        text: "Eco's power limits by hand, instead of the level's (gentle 35 W, " +
+              "deep 25/35 W, deepest 20/25 W). A burst limit set here applies " +
+              "at Gentle too, and the window is how long the CPU may run above " +
+              "PL1 before the sustained limit binds. Both are RAPL limits, " +
+              "written and restored like the level's own; a burst limit under " +
+              "the sustained one is refused. Raising them above the firmware's " +
+              "defaults buys nothing where the embedded controller caps the CPU " +
+              "on its own (the OMEN 17: 45 W over PECI). An Eco that is on " +
+              "takes a change at once."
+    }
+
     SpinBox {
         id: pollSpin
         Kirigami.FormData.label: "Refresh while open:"
@@ -206,6 +258,26 @@ Kirigami.FormLayout {
         text: "Starts NVIDIA's power daemon for as long as Max runs, unless " +
               "it runs already. On the tested RTX 4060 Laptop the GPU's limit " +
               "went from 80 W to about 130 W in the performance profile."
+    }
+
+    TextField {
+        id: gpuProfileField
+        Kirigami.FormData.label: "GPU profile in Max:"
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+        placeholderText: "leave as is"
+    }
+
+    Label {
+        Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+        wrapMode: Text.WordWrap
+        opacity: 0.7
+        font: Kirigami.Theme.smallFont
+        text: "The LACT profile selected for the NVIDIA GPU while Max runs, " +
+              "an overclock you defined in LACT, by its exact name, or " +
+              "\"default\" for LACT's own; the previous profile comes back " +
+              "when Max ends. The popup's GPU clocks card lists the names and " +
+              "needs lactd running. Empty leaves the GPU to whatever LACT has " +
+              "in force."
     }
 
     ColumnLayout {
