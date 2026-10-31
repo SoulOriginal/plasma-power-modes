@@ -38,7 +38,10 @@ this file without a password. That covers everything it does:
 - start and stop the root watts sampler, which publishes an averaged
   package wattage, what limits the CPU right now (MSR 0x64F, read-only) and
   - while some other process keeps the dGPU awake anyway - its load, clocks
-  and draw.
+  and draw;
+- with `--gpu-profile`, select a LACT profile for the dGPU while Max runs
+  (an overclock the user defined in LACT) and put the previous one back
+  when Max ends. The name is checked against LACT's own list.
 run, cleanup and watts-run start under systemd only, and every argument is
 checked: there are no free-form paths or values.
 """
@@ -1028,12 +1031,24 @@ def cmd_on(args):
         return fail(args, f"no running session for uid {uid}")
 
     boost = getattr(args, "gpu_boost", False)
+    # The dGPU's LACT profile is independent of the keeper: taken or given
+    # back here, whether or not the unit restarts below. A name LACT does
+    # not know refuses Max rather than silently running without it.
+    gpu_profile = getattr(args, "gpu_profile", None) or ""
+    gpu_report = {"want": gpu_profile or None, "ok": True, "error": None}
+    if gpu_profile:
+        ok, err = eco.gpu_profile_take(gpu_profile)
+        if not ok:
+            return fail(args, f"LACT profile {gpu_profile!r}: {err}")
+    else:
+        ok, err, _ = eco.gpu_profile_give_back()
+        gpu_report.update(ok=ok, error=err)
     running = eco.max_state()
     if running and running.get("fans") == args.fans:
         boost_error = start_powerd() if boost else stop_powerd()
         eco.emit({"ok": True, "noop": True, "state": eco.max_public(running),
                   "gpu_boost": os.path.exists(eco.POWERD_FLAG),
-                  "gpu_boost_error": boost_error}, args)
+                  "gpu_boost_error": boost_error, "gpu_profile": gpu_report}, args)
         return 0
     if running or unit_active():
         stop_unit("restart")
@@ -1068,6 +1083,7 @@ def cmd_on(args):
     state = wait_for_state()
     if state is None:
         last = eco.read_json(eco.MAX_LAST_FILE) or {}
+        eco.gpu_profile_give_back()       # Max did not start: nothing to hold it for
         return fail(args, last.get("reason") or "keep-alive did not start")
     # Dynamic Boost is extra: Max runs without it, the widget says why not.
     boost_error = start_powerd() if boost else None
@@ -1077,7 +1093,7 @@ def cmd_on(args):
         stop_powerd()
     eco.emit({"ok": True, "state": eco.max_public(state),
               "gpu_boost": os.path.exists(eco.POWERD_FLAG),
-              "gpu_boost_error": boost_error}, args)
+              "gpu_boost_error": boost_error, "gpu_profile": gpu_report}, args)
     return 0
 
 
@@ -1088,8 +1104,12 @@ def cmd_off(args):
     machine right after a crash or an older version."""
     if eco.max_state() is None and not unit_active():
         stop_powerd()             # left behind by a Max that ended as it started
+        # The dGPU's LACT profile too, for a record a crash left behind.
+        gpu_ok, gpu_err, gpu_restored = eco.gpu_profile_give_back()
         eco.emit({"ok": True, "noop": True, "msg": "max is already off",
-                  "fans": fans_to_auto(SysfsHw.detect())}, args)
+                  "fans": fans_to_auto(SysfsHw.detect()),
+                  "gpu_profile": {"restored": gpu_restored, "ok": gpu_ok,
+                                  "error": gpu_err}}, args)
         return 0
     stop_unit("off")
     if unit_active():
@@ -1099,7 +1119,10 @@ def cmd_off(args):
     # keeper died without cleaning up, and a live pid in it is someone else's.
     FileStore().clear()
     stop_powerd()                 # cleanup did it already, unless it failed
-    eco.emit({"ok": True, "msg": "stopped", "fans": fans_to_auto(SysfsHw.detect())}, args)
+    gpu_ok, gpu_err, gpu_restored = eco.gpu_profile_give_back()
+    eco.emit({"ok": True, "msg": "stopped", "fans": fans_to_auto(SysfsHw.detect()),
+              "gpu_profile": {"restored": gpu_restored, "ok": gpu_ok,
+                              "error": gpu_err}}, args)
     return 0
 
 
@@ -1279,8 +1302,13 @@ def cmd_cleanup(args):
                                else crash_armed_until(state, now)})
     FileStore().clear()
     # However Max ended - off, restart, a picked profile, logout, a crash -
-    # Dynamic Boost it started goes with it.
+    # Dynamic Boost it started goes with it, and the dGPU goes back to the
+    # LACT profile it had before Max. `off` has done the latter already then.
     stop_powerd()
+    ok, err, _ = eco.gpu_profile_give_back()
+    if not ok:
+        print(f"ecomode-max: cleanup could not put the LACT profile back: {err}",
+              file=sys.stderr, flush=True)
     return 0
 
 
@@ -1383,6 +1411,11 @@ def build_parser():
                            f"boost: full speed from {BOOST_ON_C} C")
     p_on.add_argument("--gpu-boost", action="store_true", dest="gpu_boost",
                       help="also run nvidia-powerd (Dynamic Boost) while Max is on")
+    p_on.add_argument("--gpu-profile", dest="gpu_profile", default="",
+                      help="the LACT profile to select for the dGPU while Max "
+                           f"runs ('{eco.LACT_DEFAULT}' for LACT's own); the "
+                           "previous one comes back when Max ends. Must be a "
+                           "name LACT lists. Unset: the dGPU is left alone")
     p_on.set_defaults(func=cmd_on)
 
     sub.add_parser("off", help="stop Max (and put fans left at full speed back "

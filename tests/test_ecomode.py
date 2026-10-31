@@ -1582,5 +1582,284 @@ eco.write_path = real_write_path
 cleanup()
 
 # ---------------------------------------------------------------------------
+# 23. the settings' power limits over the level's own
+# ---------------------------------------------------------------------------
+print("\n\033[1m23. power limits from the settings\033[0m")
+TAU_BASE = {**BASE, "rapl_tau": "55967744"}
+fake_sysfs(TAU_BASE)
+eco.time.sleep = lambda s: None
+res = capture(eco.cmd_on, args(level="gentle", pl1=30, pl2=40, tau=28))
+check("gentle with limits: PL1 30 W, PL2 40 W (at gentle too), Tau 28 s",
+      (val("rapl_pl1"), val("rapl_pl2"), val("rapl_tau"))
+      == ("30000000", "40000000", "28000000"),
+      (val("rapl_pl1"), val("rapl_pl2"), val("rapl_tau")))
+check("reported back as the widget reads them",
+      res["ok"] and res["limits"] == {"pl1": 30.0, "pl2": 40.0, "tau": 28.0}, res.get("limits"))
+check("the self-test covers all three",
+      {c["id"] for c in res["selftest"]["checks"]} >= {"rapl_pl1", "rapl_pl2", "rapl_tau"}
+      and res["selftest"]["pass"], res["selftest"])
+st = capture(eco.cmd_status, args())
+tau_knob = next(k for k in st["knobs"] if k["id"] == "rapl_tau")
+check("status: the limits, and the window counted into the level",
+      st["limits"] == {"pl1": 30.0, "pl2": 40.0, "tau": 28.0} and tau_knob["in_level"]
+      and tau_knob["at_eco"] and tau_knob["eco_target_human"] == "28 s", (st["limits"], tau_knob))
+res = capture(eco.cmd_on, args(level="gentle", pl1=30, pl2=40, tau=28))
+check("the same limits again are a no-op", res.get("noop") is True, res)
+res = capture(eco.cmd_on, args(level="gentle", pl1=35))
+check("a changed limit switches: PL2 and Tau back to the originals, PL1 35 W",
+      res.get("switched") is True
+      and (val("rapl_pl1"), val("rapl_pl2"), val("rapl_tau")) == ("35000000", "130000000", "55967744"),
+      (res, val("rapl_pl1"), val("rapl_pl2"), val("rapl_tau")))
+res = capture(eco.cmd_off, args())
+check("off restores the originals",
+      res["ok"] and (val("rapl_pl1"), val("rapl_pl2"), val("rapl_tau"))
+      == ("55000000", "130000000", "55967744"), res)
+st = capture(eco.cmd_status, args(pl1=20, tau=10))
+check("status while off previews the limits it is given",
+      st["limits"] == {"pl1": 20.0, "tau": 10.0}
+      and next(k for k in st["knobs"] if k["id"] == "rapl_tau")["eco_target_human"] == "10 s",
+      st["limits"])
+st = capture(eco.cmd_status, args())
+check("status while off without limits shows none and no window",
+      st["limits"] == {}
+      and not next(k for k in st["knobs"] if k["id"] == "rapl_tau")["in_level"])
+
+# The kernel keeps the nearest window the hardware can hold.
+k_tau = next(k for k in eco.KNOBS if k["id"] == "rapl_tau")
+check("rounded: 27.98 s passes for 28 s", eco.compare_knob(k_tau, "28000000", "27983872")[0] == "pass")
+check("rounded: 20 s does not", eco.compare_knob(k_tau, "28000000", "20000000")[0] == "fail")
+check("rounded: garbage fails rather than raises", eco.compare_knob(k_tau, "28000000", "x")[0] == "fail")
+
+
+def rounding_write(path, value):
+    if path.endswith("time_window_us") and value == "28000000":
+        return real_write_path(path, "27983872")
+    return real_write_path(path, value)
+
+
+eco.write_path = rounding_write
+res = capture(eco.cmd_on, args(level="gentle", tau=28))
+eco.write_path = real_write_path
+check("a rounded window passes the apply", res["ok"] and val("rapl_tau") == "27983872", res)
+st = capture(eco.cmd_status, args())
+check("... and counts as at target in the status",
+      next(k for k in st["knobs"] if k["id"] == "rapl_tau")["at_eco"] is True)
+res = capture(eco.cmd_on, args(level="gentle", tau=28))
+check("... and is not repaired as drift", res.get("noop") is True, res)
+capture(eco.cmd_off, args())
+check("off puts the old window back", val("rapl_tau") == "55967744", val("rapl_tau"))
+
+ns = argparse.Namespace
+check("bounds: PL1 above the top is refused", "pl1" in (eco.check_limits(ns(pl1=300, pl2=None, tau=None)) or ""))
+check("bounds: PL2 under PL1 is refused", "pl2" in (eco.check_limits(ns(pl1=40, pl2=30, tau=None)) or ""))
+check("bounds: a window over two minutes is refused", "tau" in (eco.check_limits(ns(pl1=None, pl2=None, tau=500)) or ""))
+check("bounds: nothing given is fine", eco.check_limits(ns(pl1=None, pl2=None, tau=None)) is None)
+check("bounds: 30/40/28 is fine", eco.check_limits(ns(pl1=30, pl2=40, tau=28)) is None)
+check("a machine without the window file: the limit is skipped, not an error",
+      (os.remove(k_tau["path"]), capture(eco.cmd_on, args(level="gentle", tau=28))["ok"])[1]
+      and not any(c["id"] == "rapl_tau" for c in capture(eco.cmd_selftest, args())["checks"]))
+capture(eco.cmd_off, args())
+eco.time.sleep = real_sleep
+cleanup()
+
+# ---------------------------------------------------------------------------
+# 24. the dGPU through LACT, against a fake lactd
+# ---------------------------------------------------------------------------
+print("\n\033[1m24. the dGPU through LACT\033[0m")
+import socket
+import threading
+
+fake_sysfs(BASE)
+SOCK = str(ROOT / "lactd.sock")
+eco.LACT_SOCKET = SOCK
+eco.GPU_PROFILE_FILE = str(ROOT / "run" / "gpu-profile.json")
+REQUESTS = []
+NV_ID = "10DE:2520-103C:8A17-0000:01:00.0"
+LACT = {"profiles": {"Overclock": None, "Quiet": None}, "current": "Overclock",
+        "auto": False, "core": 100, "mem": 180, "pending": None}
+
+
+def lact_reply(req):
+    cmd, a = req["command"], req.get("args") or {}
+
+    def ok(data):
+        return {"status": "ok", "data": data}
+
+    def err(desc):
+        return {"status": "error", "data": {"description": desc, "source": None}}
+
+    if cmd == "list_profiles":
+        return ok({"profiles": LACT["profiles"], "current_profile": LACT["current"],
+                   "auto_switch": LACT["auto"]})
+    if cmd == "list_devices":
+        return ok([{"id": "8086:46A6-103C:8A17-0000:00:02.0", "name": "Iris Xe",
+                    "device_type": "Integrated"},
+                   {"id": NV_ID, "name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+                    "device_type": "Dedicated"}])
+    if cmd == "device_clocks_info":
+        if a.get("id") != NV_ID:
+            return err("Controller not found")
+        return ok({"table": {"type": "nvidia", "value": {
+            "gpu_offsets": {"0": {"current": LACT["core"], "min": -1000, "max": 1000}},
+            "mem_offsets": {"0": {"current": LACT["mem"], "min": -2000, "max": 6000}},
+            "gpu_locked_clocks": [210, 2197], "vram_locked_clocks": [405, 7091],
+            "gpu_clock_range": [210, 2197], "vram_clock_range": [405, 7091]}}})
+    if cmd == "set_profile":
+        name = a.get("name")
+        if name is not None and name not in LACT["profiles"]:
+            return err("Profile not found")
+        LACT.update(current=name, auto=bool(a.get("auto_switch")))
+        return ok(None)
+    if cmd == "batch_set_clocks_value":
+        LACT["pending"] = {"core": LACT["core"], "mem": LACT["mem"]}
+        for c in a["commands"]:
+            if "gpu_clock_offset" in c["type"]:
+                LACT["core"] = c["value"]
+            elif "mem_clock_offset" in c["type"]:
+                LACT["mem"] = c["value"]
+        return ok(10)
+    if cmd == "confirm_pending_config":
+        if LACT["pending"] is None:
+            return err("No pending config changes")
+        if a.get("command") == "revert":
+            LACT.update(LACT["pending"])
+        LACT["pending"] = None
+        return ok(None)
+    return err("Failed to deserialize")
+
+
+def lact_serve(srv):
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        with conn:
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            req = json.loads(buf.decode())
+            REQUESTS.append(req)
+            conn.sendall((json.dumps(lact_reply(req)) + "\n").encode())
+
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(SOCK)
+srv.listen(5)
+threading.Thread(target=lact_serve, args=(srv,), daemon=True).start()
+
+check("lactd found and usable", eco.lact_available() == (True, None), eco.lact_available())
+info = eco.lact_info()
+check("profiles, the one in force and the NVIDIA card, no driver call",
+      info["available"] and info["profiles"] == ["Overclock", "Quiet"]
+      and info["current"] == "Overclock" and info["auto_switch"] is False
+      and info["device"]["id"] == NV_ID and info["clocks"] is None
+      and all(r["command"] != "device_clocks_info" for r in REQUESTS), info)
+info = eco.lact_info(clocks=True)
+check("with clocks: the P0 offsets and their ranges",
+      info["clocks"]["core"] == {"current": 100, "min": -1000, "max": 1000}
+      and info["clocks"]["mem"] == {"current": 180, "min": -2000, "max": 6000}
+      and info["clocks"]["core_locked"] == [210, 2197], info["clocks"])
+REQUESTS.clear()
+st = capture(eco.cmd_status, args())
+check("the routine status asks for the profiles only",
+      st["lact"]["available"] and st["lact"]["clocks"] is None
+      and all(r["command"] != "device_clocks_info" for r in REQUESTS), REQUESTS)
+REQUESTS.clear()
+st = capture(eco.cmd_status, args(deep=True))
+check("deep with the card asleep: still no driver call",
+      st["lact"]["clocks"] is None and all(r["command"] != "device_clocks_info" for r in REQUESTS),
+      REQUESTS)
+pathlib.Path(eco.DGPU, "power", "runtime_status").write_text("active")
+st = capture(eco.cmd_status, args(deep=True))
+check("deep with the card awake: the offsets are read",
+      st["lact"]["clocks"]["core"]["current"] == 100, st["lact"])
+
+ok, err, changed = eco.lact_set_profile("Quiet")
+check("a profile selected by name, auto-switch off",
+      ok and changed and LACT["current"] == "Quiet"
+      and REQUESTS[-1] == {"command": "set_profile", "args": {"name": "Quiet", "auto_switch": False}},
+      (ok, err, REQUESTS[-1]))
+check("selecting the one in force is a no-op", eco.lact_set_profile("Quiet") == (True, None, False))
+ok, err, changed = eco.lact_set_profile("default")
+check("'default' is LACT's own, unnamed profile",
+      ok and LACT["current"] is None and REQUESTS[-1]["args"]["name"] is None, (ok, err))
+ok, err, changed = eco.lact_set_profile("nope")
+check("a name LACT does not list is refused before any write",
+      not ok and "nope" in err and REQUESTS[-1]["command"] == "list_profiles", (ok, err))
+
+REQUESTS.clear()
+res = capture(eco.cmd_gpu, args(gpu_cmd="offset", core=150, mem=None))
+check("gpu offset: the P0 core offset, as LACT's batch command",
+      res["ok"] and res["confirm_s"] == 10 and LACT["core"] == 150
+      and REQUESTS[-1]["args"] == {"id": NV_ID, "commands": [{"type": {"gpu_clock_offset": 0}, "value": 150}]},
+      (res, REQUESTS[-1]))
+res = capture(eco.cmd_gpu, args(gpu_cmd="keep"))
+check("gpu keep confirms", res["ok"] and LACT["pending"] is None
+      and REQUESTS[-1] == {"command": "confirm_pending_config", "args": {"command": "confirm"}}, res)
+res = capture(eco.cmd_gpu, args(gpu_cmd="offset", core=200, mem=250))
+check("gpu offset: both at once", res["ok"] and (LACT["core"], LACT["mem"]) == (200, 250)
+      and [c["type"] for c in REQUESTS[-1]["args"]["commands"]]
+      == [{"gpu_clock_offset": 0}, {"mem_clock_offset": 0}], REQUESTS[-1])
+res = capture(eco.cmd_gpu, args(gpu_cmd="revert"))
+check("gpu revert puts the previous offsets back",
+      res["ok"] and (LACT["core"], LACT["mem"]) == (150, 180), (res, LACT))
+res = capture(eco.cmd_gpu, args(gpu_cmd="revert"))
+check("a revert with nothing pending is LACT's refusal, passed on",
+      res["ok"] is False and "pending" in res["reason"], res)
+REQUESTS.clear()
+res = capture(eco.cmd_gpu, args(gpu_cmd="offset", core=5000, mem=None))
+check("an offset outside LACT's range never reaches it",
+      res["ok"] is False and "core offset must be -1000..1000" in res["reason"]
+      and all(r["command"] != "batch_set_clocks_value" for r in REQUESTS), (res, REQUESTS))
+res = capture(eco.cmd_gpu, args(gpu_cmd="offset", core=None, mem=None))
+check("nothing to set is refused", res["ok"] is False, res)
+res = capture(eco.cmd_gpu, args(gpu_cmd="profile", name="Overclock"))
+check("gpu profile by name", res["ok"] and LACT["current"] == "Overclock", res)
+res = capture(eco.cmd_gpu, args(gpu_cmd="status", clocks=True))
+check("gpu status --clocks", res["available"] and res["clocks"]["core"]["current"] == 150, res)
+
+# Max's take and give back of the profile.
+LACT.update(current="Overclock", auto=True)
+ok, err = eco.gpu_profile_take("Quiet")
+rec = eco.read_json(eco.GPU_PROFILE_FILE)
+check("Max takes a profile and records the prior one with its auto-switch",
+      ok and LACT["current"] == "Quiet" and LACT["auto"] is False
+      and rec == {"prior": "Overclock", "prior_auto": True, "want": "Quiet"}, (ok, err, rec))
+ok, err = eco.gpu_profile_take("default")
+rec = eco.read_json(eco.GPU_PROFILE_FILE)
+check("a second take keeps the first prior", ok and LACT["current"] is None
+      and rec["prior"] == "Overclock" and rec["want"] == "default", rec)
+ok, err, restored = eco.gpu_profile_give_back()
+check("give back: the prior profile and its auto-switch, record gone",
+      ok and restored and LACT["current"] == "Overclock" and LACT["auto"] is True
+      and not os.path.exists(eco.GPU_PROFILE_FILE), (ok, err, LACT))
+check("give back with no record is nothing to do", eco.gpu_profile_give_back() == (True, None, False))
+ok, err = eco.gpu_profile_take("nope")
+check("a take of an unknown profile fails and records nothing",
+      not ok and "nope" in err and not os.path.exists(eco.GPU_PROFILE_FILE), (ok, err))
+
+# lactd gone, its socket file left behind: a path nobody listens on.
+srv.shutdown(socket.SHUT_RDWR)
+srv.close()
+os.remove(SOCK)
+stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+stale.bind(SOCK)
+stale.close()
+info = eco.lact_info()
+check("a socket nobody listens on: unavailable, with the error",
+      info["available"] is False and "lactd" in info["error"], info)
+check("... and gpu commands refuse", capture(eco.cmd_gpu, args(gpu_cmd="keep"))["ok"] is False)
+os.remove(SOCK)
+check("no socket at all: not installed",
+      eco.lact_available()[0] is False and "not installed" in eco.lact_available()[1])
+st = capture(eco.cmd_status, args())
+check("the status still works without LACT", st["lact"]["available"] is False and st["mode"] == "normal")
+cleanup()
+
+# ---------------------------------------------------------------------------
 print(f"\n\033[1m{PASS} passed, {FAIL} failed\033[0m")
 sys.exit(1 if FAIL else 0)
